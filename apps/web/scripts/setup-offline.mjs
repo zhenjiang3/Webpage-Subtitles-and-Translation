@@ -444,15 +444,41 @@ async function main() {
   const zipBaseUrls = platformOk ? await resolveLatestWhisperZipUrl() : [WHISPER_ZIP_FALLBACK];
   const zipUrls = withGithubProxies(zipBaseUrls);
 
-  // 2. 下载 zip（whisper-bin-x64.zip 通常 20~35MB，小于 15MB 视为下载了残缺/错误内容）
+  // 2. 下载 zip（新版本 b4938 起把 CPU 架构拆成独立 DLL，zip 只有 ≈8MB；
+  //     更早版本是 20~35MB 一体包。所以阈值设为 5MB：
+  //     - 小于 5MB → 基本是代理返回的错误页/登录页 HTML，判残
+  //     - 5~30MB → 新版拆分包或旧版一体包，都合法）
   if (platformOk) {
-    await download({
-      urls: zipUrls,
-      dest: ZIP_PATH,
-      sizeHintMB: 30,
-      minSizeMB: 15,
-      label: 'whisper-bin-x64.zip',
-    });
+    // 如果用户手动把 whisper-bin-x64.zip 放进了 WHISPER_DIR，优先用用户的那份（最可靠）
+    const userZip = path.join(WHISPER_DIR, 'whisper-bin-x64.zip');
+    if (fs.existsSync(userZip) && fs.statSync(userZip).size > 0) {
+      const userMB = (fs.statSync(userZip).size / 1024 / 1024).toFixed(1);
+      console.log(`✔ 检测到你手动放置了 whisper-bin-x64.zip（${userMB}MB）：${userZip}`);
+      // 5MB 阈值同样适用于用户手动放的文件：太小（≤3-4MB）大概率是下载了 HTML/错误页而不自知
+      if (fs.statSync(userZip).size < 5 * 1024 * 1024) {
+        console.warn(
+          `⚠ 该 zip 只有 ${userMB}MB（< 5MB），很可能不是真正的 whisper 预编译包，` +
+            `通常是浏览器/代理返回了错误页或登录页。\n` +
+            `  脚本将自动忽略它，继续使用下载链路；如果确定这个 zip 是正确的，请重新下载 ≥ 5MB 的版本再运行。`,
+        );
+      } else {
+        console.log(`  将作为解压源使用（不再下载）。`);
+        // 复制一份到 ZIP_PATH（临时路径）给后续解压步骤使用
+        if (path.resolve(userZip) !== path.resolve(ZIP_PATH)) {
+          fs.copyFileSync(userZip, ZIP_PATH);
+        }
+      }
+    }
+    // 如果用户没放，或者放的 zip < 5MB 被判定为残包，都会走下载链路
+    if (!fs.existsSync(ZIP_PATH) || fs.statSync(ZIP_PATH).size < 5 * 1024 * 1024) {
+      await download({
+        urls: zipUrls,
+        dest: ZIP_PATH,
+        sizeHintMB: 30,
+        minSizeMB: 5,
+        label: 'whisper-bin-x64.zip',
+      });
+    }
 
     // 3. 解压
     console.log(`  ▶ 解压 ${path.basename(ZIP_PATH)}  →  ${WHISPER_DIR}`);
