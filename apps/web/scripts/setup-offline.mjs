@@ -32,11 +32,72 @@ const MODELS_DIR = path.join(WHISPER_DIR, 'models');
 const ZIP_PATH = path.join(os.tmpdir(), `whisper-bin-x64-${Date.now()}.zip`);
 const MODEL_PATH = path.join(MODELS_DIR, 'ggml-small.bin');
 
-// —— 可下载源（官方 + 国内镜像，做容错）——
+// —— 可下载源（官方 + 国内镜像/代理，做容错；顺序即优先级）——
 const WHISPER_RELEASE_API = 'https://api.github.com/repos/ggml-org/whisper.cpp/releases/latest';
 const WHISPER_ZIP_FALLBACK = 'https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip';
+
+// GitHub 国内加速代理（注意代理 URL 规则：直接把原始 https://github.com/... 接在代理域名后面即可）
+const GITHUB_PROXY_MOEYY = 'https://github.moeyy.xyz/';
+const GITHUB_PROXY_GHPROXY = 'https://ghproxy.cc/';
+
+// HuggingFace 模型：官方 + 国内镜像
 const HUGGINGFACE_MODEL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin';
 const HUGGINGFACE_MIRROR = 'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin';
+// ModelScope（阿里国内镜像）同模型；如果 HF 直连+镜像都失败时用它兜底
+const MODELSCOPE_MODEL =
+  'https://www.modelscope.cn/models/AI-ModelScope/whisper.cpp/resolve/master/ggml-small.bin';
+
+/**
+ * 统一错误展开：Node 的 fetch() 失败往往只是 TypeError("fetch failed")，
+ * 真正的原因（DNS/超时/证书/代理/ECONNRESET 等）藏在 err.cause / err.cause.cause 里。
+ * 这里做递归展开，便于用户定位是证书还是代理还是DNS。
+ */
+function formatError(err) {
+  if (err == null) return String(err);
+  const top = err && err.message ? err.message : String(err);
+  const parts = [top];
+  let cur = err;
+  let depth = 0;
+  while (cur && cur.cause && depth < 5) {
+    cur = cur.cause;
+    const seg = [];
+    if (cur.code) seg.push(`code=${cur.code}`);
+    if (cur.message) seg.push(cur.message);
+    if (cur.syscall) seg.push(`syscall=${cur.syscall}`);
+    if (cur.hostname) seg.push(`host=${cur.hostname}`);
+    if (cur.address) seg.push(`addr=${cur.address}`);
+    if (seg.length) parts.push('  原因: ' + seg.join(' | '));
+    depth += 1;
+  }
+  return parts.join('\n');
+}
+
+/**
+ * 把一个 GitHub 原始下载 URL 变成“代理版”（用于国内网络加速）
+ * 例：https://github.com/xxx/yyy/releases/download/v1/whisper-bin-x64.zip
+ *  →  https://github.moeyy.xyz/https://github.com/xxx/yyy/releases/download/v1/whisper-bin-x64.zip
+ */
+function throughProxy(proxyBase, rawUrl) {
+  if (!proxyBase) return rawUrl;
+  return proxyBase.replace(/\/$/, '') + '/' + rawUrl;
+}
+
+/**
+ * 给一个候选 URL 列表做代理扩展：
+ *   [官方直连, 兜底直连]  →  [官方直连, moeyy代理(官方), ghproxy代理(官方), 兜底直连, moeyy代理(兜底), ghproxy代理(兜底)]
+ * 这样 1 个 30MB 的 zip 最多有 6 条下载路径，极大提升国内网络成功率。
+ */
+function withGithubProxies(urls) {
+  const proxies = [undefined, GITHUB_PROXY_MOEYY, GITHUB_PROXY_GHPROXY];
+  const result = [];
+  for (const u of urls) {
+    for (const p of proxies) {
+      result.push(throughProxy(p, u));
+    }
+  }
+  // 去重（相同 URL 不重复试）
+  return [...new Set(result)];
+}
 
 // —— 简易进度条（ETL 风格）——
 function makeProgress(label, sizeHintMB) {
@@ -106,7 +167,7 @@ async function download({ urls, dest, sizeHintMB, label }) {
       return;
     } catch (e) {
       lastErr = e;
-      console.warn(`\n⚠ ${label} 从 ${url} 下载失败：${e && e.message ? e.message : String(e)}`);
+      console.warn(`\n⚠ ${label} 从 ${url} 下载失败：\n${formatError(e)}`);
       try {
         fs.rmSync(tmp, { force: true });
       } catch {
@@ -114,7 +175,7 @@ async function download({ urls, dest, sizeHintMB, label }) {
       }
     }
   }
-  throw new Error(`所有 ${label} 下载源全部失败。最后一个错误：${lastErr && lastErr.message ? lastErr.message : String(lastErr)}`);
+  throw new Error(`所有 ${label} 下载源全部失败。最后一个错误：\n${formatError(lastErr)}`);
 }
 
 /**
@@ -147,7 +208,7 @@ async function resolveLatestWhisperZipUrl() {
       if (hit?.browser_download_url) return [hit.browser_download_url, WHISPER_ZIP_FALLBACK];
     }
   } catch (e) {
-    console.warn(`⚠ 获取 GitHub Releases 元数据失败，直接用固定 URL。原因：${e && e.message ? e.message : String(e)}`);
+    console.warn(`⚠ 获取 GitHub Releases 元数据失败，直接用固定 URL。原因：\n${formatError(e)}`);
   }
   return [WHISPER_ZIP_FALLBACK];
 }
@@ -192,8 +253,9 @@ async function main() {
   console.log(`  目标目录：${WHISPER_DIR}`);
   console.log(`  预计总下载：~30MB (zip) + 487MB (model)，解压后约 550MB。\n`);
 
-  // 1. 解析最新下载 URL
-  const zipUrls = platformOk ? await resolveLatestWhisperZipUrl() : [WHISPER_ZIP_FALLBACK];
+  // 1. 解析最新下载 URL（官方直连 + 两个 GitHub 代理共 6 条候选链路）
+  const zipBaseUrls = platformOk ? await resolveLatestWhisperZipUrl() : [WHISPER_ZIP_FALLBACK];
+  const zipUrls = withGithubProxies(zipBaseUrls);
 
   // 2. 下载 zip
   if (platformOk) {
@@ -233,9 +295,9 @@ async function main() {
     }
   }
 
-  // 4. 下载模型 ggml-small.bin
+  // 4. 下载模型 ggml-small.bin（优先级：HF 官方 → hf-mirror 国内镜像 → ModelScope 国内镜像）
   await download({
-    urls: [HUGGINGFACE_MODEL, HUGGINGFACE_MIRROR],
+    urls: [HUGGINGFACE_MODEL, HUGGINGFACE_MIRROR, MODELSCOPE_MODEL],
     dest: MODEL_PATH,
     sizeHintMB: 487,
     label: 'ggml-small.bin（ASR 模型）',
