@@ -53,6 +53,52 @@ function normalizeLang(lang: string | undefined): LanguageCode {
 }
 
 /**
+ * 列出 dir 目录下所有文件（文件名+size 简写），作为错误诊断信息
+ * 不超过 200 个字符，避免错误信息爆炸
+ */
+function listDirBrief(dir: string): string {
+  try {
+    const items = fs.readdirSync(dir).map((name) => {
+      const p = path.join(dir, name);
+      try {
+        const st = fs.statSync(p);
+        return `${name}(${formatBytes(st.size)})`;
+      } catch {
+        return `${name}`;
+      }
+    });
+    const all = items.join(', ');
+    return all.length > 500 ? all.slice(0, 500) + ` …(+${items.length}项)` : all || '(空目录)';
+  } catch (e) {
+    return `[列目录失败] ${e instanceof Error ? e.message : String(e)}`;
+  }
+}
+
+function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let i = 0;
+  let v = bytes;
+  while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)}${units[i]}`;
+}
+
+/**
+ * 把 Node spawn 的 args 数组拼成 PowerShell/CMD 可直接复制运行的形式
+ * 遇到空格或 &/;/'/" 等字符就用双引号包住并转义内部双引号
+ */
+function formatArgsForShell(args: readonly string[]): string {
+  return args
+    .map((a) => {
+      if (/[\s&;'"]/.test(a)) {
+        return `"${a.replace(/"/g, '""')}"`;
+      }
+      return a;
+    })
+    .join(' ');
+}
+
+/**
  * 从 whisper.cpp stderr/stdout 中提取 "[DetectedLanguage]: xx"
  * 不同版本 whisper.cpp 输出格式有差异，这里兼容几种常见模式
  */
@@ -112,44 +158,66 @@ export class WhisperCppProvider implements AsrProvider {
 
     const lang = opts.langHint ? LANG_TO_WHISPER[opts.langHint] : 'auto';
 
-    // SRT 输出到与音频同目录的 .tmp.srt，避免重名冲突
     const audioDir = path.dirname(audioPath);
-    const base = path.basename(audioPath, path.extname(audioPath));
-    const srtOutPrefix = path.join(audioDir, `${base}.whisper-out`);
-    const expectedSrt = `${srtOutPrefix}.srt`;
+    const audioExt = path.extname(audioPath); // .wav
+    const base = path.basename(audioPath, audioExt); // audio
 
-    // 先清理可能的旧输出
+    // —— 关于 SRT 输出命名：whisper.cpp 不同版本对 `-of prefix` 行为差异很大：
+    //   a) 老版：-of prefix 会输出 prefix.srt
+    //   b) 新版 (b4938/1.9.x)：-of prefix 输出 prefix.wav.srt（把输入文件名 wav 也再追加一次后缀）
+    //   c) 不开 -of 只开 -osrt：输出 <input>.srt
+    //   d) 不写 -osrt/-of：默认输出多格式 .wav.srt/.wav.vtt 等
+    // 所以这里：我们写一个「期望输出路径」，但在完成后不依赖单一路径，会枚举 audioDir 所有 .srt 兜底寻找。
+    const srtOutPrefix = path.join(audioDir, `${base}.whisper-out`);
+    const expectedByOfParam = `${srtOutPrefix}.srt`; // 老版行为
+    const expectedByOfParamWavSfx = `${srtOutPrefix}${audioExt}.srt`; // b4938 新版行为
+
+    // 清理可能的历史输出（避免把上次遗留当成这次产物）
     try {
-      fs.rmSync(expectedSrt, { force: true });
+      for (const f of fs.readdirSync(audioDir)) {
+        if (f.endsWith('.srt')) fs.rmSync(path.join(audioDir, f), { force: true });
+      }
     } catch {
       /* noop */
     }
 
-    const args = [
+    // 组合参数：优先写死最稳定的「-osrt + -of prefix」组合，新版老版都能接受
+    const args: string[] = [
       '-m',
       this.modelPath,
       '-f',
       audioPath,
       '-l',
       lang,
-      '-p',
+      '-t',
       String(this.threads),
-      '-osrt', // 输出 SRT 格式字幕
+      '-osrt',
       '-of',
-      srtOutPrefix, // 输出文件前缀（会自动追加 .srt）
-      '-ng', // 不输出字形进度字符，减少 stderr 噪声
-      '-v', // 错误时 verbose
+      srtOutPrefix,
+      '-ng',
+      '-v',
     ];
+
+    // eslint-disable-next-line no-console
+    console.log(
+      '[whisper-cpp] spawn:',
+      '\n  cli   :', this.cliPath,
+      '\n  model :', this.modelPath,
+      '\n  audio :', audioPath,
+      `(${fs.existsSync(audioPath) ? `size=${fs.statSync(audioPath).size} bytes` : 'MISSING'})`,
+      '\n  args  :',
+      JSON.stringify(args),
+    );
 
     opts.onProgress?.(8, `启动 whisper.cpp（模型 ${path.basename(this.modelPath)}，线程 ${this.threads}）...`);
 
     let startTs = Date.now();
     const stderrBuf: Buffer[] = [];
+    const stdoutBuf: Buffer[] = [];
 
     await new Promise<void>((resolve, reject) => {
       const child = spawn(this.cliPath, args, { windowsHide: true });
 
-      // 伪进度：按时间平滑推送，whisper.cpp 没有实时进度 API
       let fakePct = 10;
       const stage = '本地语音识别中（whisper.cpp CPU）';
       const timer = setInterval(() => {
@@ -159,9 +227,8 @@ export class WhisperCppProvider implements AsrProvider {
         }
       }, 3000);
 
-      child.stderr?.on('data', (d) => {
-        stderrBuf.push(d);
-      });
+      child.stderr?.on('data', (d) => stderrBuf.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+      child.stdout?.on('data', (d) => stdoutBuf.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
 
       child.on('error', (err) => {
         clearInterval(timer);
@@ -171,40 +238,96 @@ export class WhisperCppProvider implements AsrProvider {
         clearInterval(timer);
         const elapsed = ((Date.now() - startTs) / 1000).toFixed(1);
         if (code === 0) {
-          opts.onProgress?.(93, `whisper.cpp 完成（耗时 ${elapsed}s），解析 SRT...`);
+          opts.onProgress?.(93, `whisper.cpp 完成（耗时 ${elapsed}s），查找 SRT...`);
           resolve();
         } else {
-          const stderrText = Buffer.concat(stderrBuf).toString('utf8').slice(-800);
+          const stderrText = Buffer.concat(stderrBuf).toString('utf8').slice(-1500);
+          const stdoutText = Buffer.concat(stdoutBuf).toString('utf8').slice(-1500);
           reject(
             new Error(
               `[whisper-cpp] 退出码 ${code}（signal ${signal ?? 'none'}）。\n` +
-                `命令：${path.basename(this.cliPath)} ${args.slice(0, 6).join(' ')} ...\n` +
-                `stderr 末尾：\n${stderrText}`,
+                `cli: ${this.cliPath}\n` +
+                `args: ${JSON.stringify(args)}\n` +
+                `cwd 目录文件：${listDirBrief(audioDir)}\n` +
+                `stderr 末尾：\n${stderrText}\n` +
+                `stdout 末尾：\n${stdoutText}`,
             ),
           );
         }
       });
     });
 
-    if (!fs.existsSync(expectedSrt)) {
-      // 某些版本 whisper.cpp 可能输出到 <audioPath>.srt（当 -of 不生效时），兜底
-      const fallback = `${audioPath}.srt`;
-      if (fs.existsSync(fallback)) {
-        fs.copyFileSync(fallback, expectedSrt);
-      } else {
-        throw new Error(
-          `[whisper-cpp] 未找到生成的 SRT 文件，期望：${expectedSrt}\n` +
-            `请检查 whisper-cli.exe 版本（推荐 1.7.3+）或手动验证 ${path.basename(audioPath)}.wav 是否 16kHz 单声道 PCM。`,
-        );
+    // —— 找 SRT 文件：按优先级找第一个存在且大小 > 0 的
+    const srtSearchCandidates = [
+      expectedByOfParam,
+      expectedByOfParamWavSfx,
+      `${audioPath}.srt`,
+    ];
+    let resolvedSrt: string | null = null;
+    for (const candidate of srtSearchCandidates) {
+      try {
+        if (fs.existsSync(candidate) && fs.statSync(candidate).size > 0) {
+          resolvedSrt = candidate;
+          break;
+        }
+      } catch {
+        /* ignore */
+      }
+    }
+    if (!resolvedSrt) {
+      // 终极兜底：audioDir 下所有 .srt，按 mtime 最新 → size 最大排序，挑第一个非空的
+      try {
+        const all = fs.readdirSync(audioDir)
+          .filter((n) => n.toLowerCase().endsWith('.srt'))
+          .map((n) => path.join(audioDir, n))
+          .filter((p) => {
+            try {
+              return fs.statSync(p).size > 0;
+            } catch {
+              return false;
+            }
+          })
+          .sort((a, b) => {
+            const ma = fs.statSync(a).mtimeMs;
+            const mb = fs.statSync(b).mtimeMs;
+            if (mb !== ma) return mb - ma;
+            return fs.statSync(b).size - fs.statSync(a).size;
+          });
+        resolvedSrt = all[0] ?? null;
+      } catch {
+        resolvedSrt = null;
       }
     }
 
-    const srtText = await fs.promises.readFile(expectedSrt, 'utf8');
+    if (!resolvedSrt) {
+      const stderrText = Buffer.concat(stderrBuf).toString('utf8').slice(-1500);
+      const stdoutText = Buffer.concat(stdoutBuf).toString('utf8').slice(-1500);
+      throw new Error(
+        `[whisper-cpp] 未找到生成的 SRT 文件。\n` +
+          `按优先级查过：\n  - ${srtSearchCandidates.join('\n  - ')}\n` +
+          `目录实际文件：\n${listDirBrief(audioDir)}\n` +
+          `cli  : ${this.cliPath}\n` +
+          `args : ${JSON.stringify(args)}\n` +
+          `建议：手动在 PowerShell 里跑一遍（复制粘贴即可，退出码应当 0 并生成 SRT）：\n` +
+          `  & "${this.cliPath}" ${formatArgsForShell(args)}\n` +
+          `whisper-cli stderr 末尾：\n${stderrText}\n` +
+          `whisper-cli stdout 末尾：\n${stdoutText}`,
+      );
+    }
+
+    // eslint-disable-next-line no-console
+    console.log(`[whisper-cpp] 命中 SRT 文件：${resolvedSrt} (size=${fs.statSync(resolvedSrt).size} bytes)`);
+
+    const srtText = await fs.promises.readFile(resolvedSrt, 'utf8');
     const cues = parseSrt(srtText);
 
-    // 清理临时 SRT
+    // 清理所有本次产生的临时 SRT
     try {
-      fs.rmSync(expectedSrt, { force: true });
+      for (const f of fs.readdirSync(audioDir)) {
+        if (f.toLowerCase().endsWith('.srt')) {
+          try { fs.rmSync(path.join(audioDir, f), { force: true }); } catch { /* noop */ }
+        }
+      }
     } catch {
       /* noop */
     }
