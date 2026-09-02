@@ -31,124 +31,131 @@ type XenovaTransformersMod = any;
 let cachedModPromise: Promise<XenovaTransformersMod> | null = null;
 let cachedPipelinePromise: Promise<XenovaPipelineFn> | null = null;
 
+/**
+ * 向上回溯 markers 命中的项目根（不依赖 Webpack __dirname / process.cwd()）。
+ * 返回绝对路径。优先命中 markers 数量 ≥2 的目录。
+ */
+function resolveProjectRoot(): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const NodeFs = require('node:fs') as typeof import('node:fs');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const NodePath = require('node:path') as typeof import('node:path');
+  const cwd = process.cwd();
+  const markers = ['pnpm-workspace.yaml', 'pnpm-lock.yaml', 'package.json', '.git', 'apps', 'data'];
+  let dir = cwd;
+  for (let i = 0; i < 8; i++) {
+    let hit = 0;
+    for (const m of markers) {
+      try { if (NodeFs.existsSync(NodePath.join(dir, m))) hit++; } catch { /* noop */ }
+    }
+    if (hit >= 2) return dir;
+    const parent = NodePath.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return cwd;
+}
+
+/**
+ * 解析「项目下 apps/web/tools/shim/sharp.cjs」真实存在的绝对路径。
+ * 找不到时写临时文件到 .next/shims/sharp.cjs 并返回那条路径（终极兜底）。
+ * 不在 Hook 里 new Module / 不动 prototype.load，避免 Next webpack 两套 Module 原型引用不同
+ *   导致 instanceof 报错：TypeError: The "mod" argument must be an instance of Module. Received an instance of Module。
+ */
+function resolveSharpShim(): string {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const NodeFs = require('node:fs') as typeof import('node:fs');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
+  const NodePath = require('node:path') as typeof import('node:path');
+  const root = resolveProjectRoot();
+  const candidates: string[] = [];
+
+  candidates.push(NodePath.join(root, 'apps/web/tools/shim/sharp.cjs'));
+  candidates.push(NodePath.join(root, 'tools/shim/sharp.cjs'));
+  candidates.push(NodePath.join(root, 'apps/web/src/server/translator/.__sharp-shim__.cjs'));
+
+  if (typeof __filename === 'string') {
+    let d = NodePath.dirname(__filename);
+    for (let i = 0; i < 6; i++) {
+      const base = NodePath.basename(d);
+      if (base === 'web') {
+        candidates.push(NodePath.join(d, 'tools/shim/sharp.cjs'));
+        candidates.push(NodePath.join(d, 'src/server/translator/.__sharp-shim__.cjs'));
+        break;
+      }
+      const parent = NodePath.dirname(d);
+      if (parent === d) break;
+      d = parent;
+    }
+  }
+
+  for (const c of candidates) {
+    try { if (NodeFs.existsSync(c)) return c; } catch { /* noop */ }
+  }
+
+  // 写临时文件
+  const shimDir = NodePath.join(root, '.next', 'shims');
+  try { NodeFs.mkdirSync(shimDir, { recursive: true }); } catch { /* noop */ }
+  const dst = NodePath.join(shimDir, 'sharp.cjs');
+  const SQ = "'";
+  const L: string[] = [];
+  L.push(SQ + 'use strict' + SQ + ';');
+  L.push('// Sharp shim auto-generated at runtime (V1 text-only path).');
+  L.push('// Xenova 顶层 require(' + SQ + 'sharp' + SQ + ') 时使用，避免因 sharp 原生二进制缺失炸 import。');
+  L.push('function createChainable() {');
+  L.push('  var base = Object.create(null);');
+  L.push('  base.toBuffer = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] toBuffer called, enable real sharp.' + SQ + ')); };');
+  L.push('  base.toFile   = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] toFile called, enable real sharp.' + SQ + ')); };');
+  L.push('  base.metadata = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] metadata called, enable real sharp.' + SQ + ')); };');
+  L.push('  base.clone = function () { return this; };');
+  L.push('  base.pipe  = function () { return this; };');
+  L.push('  return new Proxy(base, {');
+  L.push('    get: function (t, p, r) {');
+  L.push('      var k = String(p);');
+  L.push('      if (k === ' + SQ + 'then' + SQ + ' || k === ' + SQ + 'catch' + SQ + ' || k === ' + SQ + 'finally' + SQ + ') return undefined;');
+  L.push('      if (Object.prototype.hasOwnProperty.call(t, k)) return Reflect.get(t, k, r);');
+  L.push('      return function () { return createChainable(); };');
+  L.push('    }');
+  L.push('  });');
+  L.push('}');
+  L.push('function sharpConstructor() { return createChainable(); }');
+  L.push('sharpConstructor.Sharp = function () { return sharpConstructor.apply(null, arguments); };');
+  L.push('sharpConstructor.default = sharpConstructor;');
+  L.push('sharpConstructor.concurrency = function (n) { return n === undefined ? 1 : sharpConstructor; };');
+  L.push('sharpConstructor.counters    = function ()  { return { process: 0, queue: 0 }; };');
+  L.push('sharpConstructor.simd        = function ()  { return sharpConstructor; };');
+  L.push('sharpConstructor.cache       = function (v) { return v === undefined ? { memory: 0, files: 0, items: 0 } : sharpConstructor; };');
+  L.push('sharpConstructor.queue       = function ()  { return 0; };');
+  L.push('sharpConstructor.versions    = { libvips: ' + SQ + '0.0.0-shim' + SQ + ', sharp: ' + SQ + '0.32.6-shim' + SQ + ', vips: ' + SQ + '0.0.0-shim' + SQ + ' };');
+  L.push('sharpConstructor.format      = Object.freeze({ jpeg: { id: ' + SQ + 'jpeg' + SQ + ' }, png: { id: ' + SQ + 'png' + SQ + ' }, webp: { id: ' + SQ + 'webp' + SQ + ' }, avif: { id: ' + SQ + 'avif' + SQ + ' }, gif: { id: ' + SQ + 'gif' + SQ + ' }, tiff: { id: ' + SQ + 'tiff' + SQ + ' } });');
+  L.push('module.exports = sharpConstructor;');
+  L.push('module.exports.default = sharpConstructor;');
+  L.push('module.exports.Sharp = sharpConstructor.Sharp;');
+
+  try { NodeFs.writeFileSync(dst, L.join(require('node:os').EOL), 'utf8'); } catch { /* noop */ }
+  try { if (NodeFs.existsSync(dst)) return dst; } catch { /* noop */ }
+
+  throw new Error(
+    '[xenova-nllb] 无法定位 sharp shim 文件，且无法写入 .next/shims/sharp.cjs 临时文件。\n' +
+      '候选路径：\n  - ' + candidates.join('\n  - '),
+  );
+}
+
 function loadTransformers(): Promise<XenovaTransformersMod> {
   if (cachedModPromise) return cachedModPromise;
-  // —— 安装 sharp shim（仅在 xenova import 执行前做一次性 Hook）——
-  // 根因：
-  //   @xenova/transformers 的入口 pipelines.js 顶层 require('./RawImage')，RawImage.js 顶层 require('sharp')。
-  //   但我们的 V1 只做纯文本翻译，完全不碰图像输入。之前 pnpm install --ignore-scripts 跳过了 sharp 的
-  //   原生二进制编译（`sharp-win32-x64.node` 文件缺失），导致 import('@xenova/transformers') 第一行直接炸，
-  //   连 pipeline 都创建不了。
-  // 方案：
-  //   重写 Module._resolveFilename：当 request === 'sharp' 时，返回一个指向「本文件同级的 .__sharp-shim__.cjs」
-  //   的绝对路径。这个 shim 仅 export 一个构造函数 + 若干 sharp.* 静态方法，不会被真正调用。
-  //   这样 RawImage.js require('sharp') 时得到 shim 对象，它的 require.cache 也不会污染 sharp 真实模块。
+
+  // 安装一次性 Hook：仅重写 Module._resolveFilename，遇到 require('sharp') 直接返回磁盘真实存在的
+  // sharp shim .cjs 路径，让 Node/Next 正常 CJS require 它，完全不 new Module，不覆盖 prototype.load。
   (globalThis as unknown as { __XENOVA_NLLB_SHARP_SHIM_INSTALLED__?: boolean }).__XENOVA_NLLB_SHARP_SHIM_INSTALLED__ ??= (() => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
     const NodeModule = require('node:module') as typeof import('node:module') & {
       _resolveFilename: (request: string, parent: unknown, isMain: boolean, options?: unknown) => string;
-      prototype: NodeJS.Module & {
-        load: (filename: string) => void;
-      };
     };
     const origResolve = NodeModule._resolveFilename.bind(NodeModule);
-    // 注意：Module.prototype.load 是所有 CJS 模块加载共用的方法，子类（如内部 Module 实例）实际都会走这一个。
-    // 为了「_resolveFilename 返回 stubKey 后，loader 真的不会去磁盘 open('stubKey') 读取」，
-    // 我们在 Module.prototype.load 里拦截：如果 filename === stubKey 并且 require.cache[stubKey].loaded=true，
-    // 直接 return（exports 已经在 _resolveFilename 阶段填好）。
-    const origLoad = NodeModule.prototype.load.bind(NodeModule.prototype);
-
-    const stubKey = require('node:path').resolve(process.cwd(), '.next_xenova_sharp_stub');
-
-    function assembleExports(parent: NodeJS.Module | undefined): NodeJS.Module {
-      const cached = require.cache[stubKey];
-      if (cached && cached.loaded) return cached;
-      const mod = new (NodeModule as unknown as new (id: string, parentMod: unknown) => NodeJS.Module)(stubKey, parent);
-
-      // 优先读我们 git 提交的 .__sharp-shim__.cjs 源文件（方便调试/扩展）
-      const NodeFs = require('node:fs') as typeof import('node:fs');
-      const NodePath = require('node:path') as typeof import('node:path');
-      const candidates = [
-        typeof __filename === 'string' ? NodePath.join(NodePath.dirname(__filename), '.__sharp-shim__.cjs') : null,
-        NodePath.resolve(process.cwd(), 'apps/web/src/server/translator/.__sharp-shim__.cjs'),
-      ].filter((x): x is string => !!x);
-      let stubSrc: string | null = null;
-      for (const c of candidates) {
-        try {
-          if (NodeFs.existsSync(c)) { stubSrc = NodeFs.readFileSync(c, 'utf8'); break; }
-        } catch { /* noop */ }
-      }
-
-      if (stubSrc) {
-        mod.filename = stubKey;
-        mod.paths = (NodeModule as unknown as { _nodeModulePaths?: (p: string) => string[] })._nodeModulePaths
-          ? (NodeModule as unknown as { _nodeModulePaths: (p: string) => string[] })._nodeModulePaths(stubKey)
-          : [];
-        // 注意：调用 _compile 会把 module.exports 正确初始化，并且 .loaded 在结束时被 Node 置 true（我们后面再手动 set）
-        (mod as unknown as { _compile?: (content: string, filename: string) => void })._compile?.(stubSrc, stubKey);
-      } else {
-        // 文件不可读 → 纯内存兜底组装 exports（跟磁盘 shim 导出协议等价）
-        const stubInst: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
-        stubInst.toBuffer = function toBuffer() {
-          return Promise.reject(new Error('[sharp-shim] 走到了 toBuffer，但 V1 未启用真实 sharp 二进制。请联系开发者启用。'));
-        };
-        stubInst.toFile = function toFile() {
-          return Promise.reject(new Error('[sharp-shim] 走到了 toFile，但 V1 未启用真实 sharp 二进制。请联系开发者启用。'));
-        };
-        stubInst.metadata = function metadata() {
-          return Promise.reject(new Error('[sharp-shim] 走到了 metadata，但 V1 未启用真实 sharp 二进制。请联系开发者启用。'));
-        };
-        stubInst.clone = function clone() { return stubInst; };
-        stubInst.pipe = function pipe() { return stubInst; };
-
-        const chainable = new Proxy(stubInst, {
-          get(t, prop, rcv) {
-            const k = String(prop);
-            if (k in t) return Reflect.get(t, k, rcv);
-            return function stubChain() { return chainable; };
-          },
-        });
-        function sharpConstructor() { return chainable; }
-        sharpConstructor.Sharp = function SharpCompatCtor() { return chainable; };
-        sharpConstructor.default = sharpConstructor;
-        sharpConstructor.concurrency = () => 1;
-        sharpConstructor.counters = () => ({});
-        sharpConstructor.simd = function simd() { return sharpConstructor; };
-        sharpConstructor.cache = function cacheFn() { return sharpConstructor; };
-        sharpConstructor.queue = function queue() { return {}; };
-        sharpConstructor.versions = { libvips: '0.0.0-shim', sharp: '0.32.6-shim' };
-
-        mod.exports = sharpConstructor;
-        mod.filename = stubKey;
-      }
-
-      mod.loaded = true;
-      require.cache[stubKey] = mod;
-      return mod;
-    }
-
+    const shimPath = resolveSharpShim();
     NodeModule._resolveFilename = function xenovaSharpShimResolve(request, parent, isMain, options) {
-      if (request === 'sharp') {
-        assembleExports(parent as NodeJS.Module | undefined);
-        return stubKey;
-      }
+      if (request === 'sharp') return shimPath;
       return origResolve(request, parent, isMain, options);
-    };
-
-    // 关键：防止 loader 用 stubKey 去 open/read 磁盘文件（stubKey 在磁盘上不存在 → ENOENT）
-    NodeModule.prototype.load = function xenovaSharpShimModuleLoad(filename: string) {
-      if (filename === stubKey) {
-        const mod = assembleExports(/* parent */ undefined);
-        this.exports = mod.exports;
-        this.filename = filename;
-        // paths/path/loaded 已经在 assembleExports 里处理过，或仅复制：
-        if ((mod as unknown as { paths?: string[] }).paths) {
-          this.paths = (mod as unknown as { paths: string[] }).paths;
-        }
-        this.loaded = true;
-        return;
-      }
-      return origLoad.call(this, filename);
     };
     return true;
   })();
@@ -156,8 +163,6 @@ function loadTransformers(): Promise<XenovaTransformersMod> {
   // eslint-disable-next-line no-console
   console.log('[xenova-nllb] 开始加载 @xenova/transformers（第一次需 1-10 秒）...');
 
-  // 动态 import —— @xenova/transformers 在 ESM 中，也兼容 CJS require()
-  // 为避免 Next.js edge/server 打包告警，放在函数内动态导入
   cachedModPromise = import('@xenova/transformers')
     .then((mod) => {
       // eslint-disable-next-line no-console
@@ -166,13 +171,13 @@ function loadTransformers(): Promise<XenovaTransformersMod> {
     })
     .catch((e) => {
       cachedModPromise = null;
-      throw new Error(
-        `[xenova-nllb] 无法加载 @xenova/transformers，请确认已安装依赖：\n` +
-          `  pnpm --filter @app/web add @xenova/transformers\n` +
-          `  （若报错仍指向 sharp-win32-x64.node：在 PowerShell 新窗口执行下方方案 B 两条 rebuild sharp 命令）\n` +
-          `原始错误：${(e as Error).message}\n` +
-          (e instanceof Error && e.stack ? `调用栈：\n${e.stack}\n` : ''),
-      );
+      const msg =
+        '[xenova-nllb] 无法加载 @xenova/transformers，请确认已安装依赖：\n' +
+        '  pnpm --filter @app/web add @xenova/transformers\n' +
+        '  （若报错仍指向 sharp-win32-x64.node：在 PowerShell 新窗口执行 rebuild sharp 命令）\n' +
+        '原始错误：' + ((e as Error).message ?? String(e)) + '\n' +
+        (e instanceof Error && e.stack ? '调用栈：\n' + e.stack + '\n' : '');
+      throw new Error(msg);
     });
   return cachedModPromise;
 }
@@ -242,10 +247,10 @@ async function translateSlice(
         do_sample: false, // 贪心解码，字幕翻译要求确定性
       } as object);
       const arr = Array.isArray(raw) ? raw : [raw];
-      const texts = arr.map((r: { translation_text?: string }) => r?.translation_text ?? '');
+      const outTexts = arr.map((r: { translation_text?: string }) => r?.translation_text ?? '');
       // 回填到对应位置
       indices.forEach((origIdx, j) => {
-        translated[origIdx] = texts[j] ?? batch[origIdx] ?? '';
+        translated[origIdx] = outTexts[j] ?? batch[origIdx] ?? '';
       });
     }
     results.push(...translated);
