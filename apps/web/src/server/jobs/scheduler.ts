@@ -24,8 +24,24 @@ async function ensureBootstrap() {
   const lines: string[] = [];
   lines.push('==== ASR/翻译 环境自检 ====');
   // 1. ffmpeg / ffprobe
-  const ffmpegOk = await isFFmpegAvailable();
-  lines.push(`[ffmpeg]       ${ffmpegOk ? '✅ PATH 可用' : '❌ PATH 中找不到 ffmpeg，请 winget install Gyan.FFmpeg 后重开终端'}`);
+  const ffmpegCheck = await isFFmpegAvailable();
+  if (ffmpegCheck.ok) {
+    lines.push('[ffmpeg]       ✅ 就绪');
+    if (ffmpegCheck.ffmpegPath) lines.push(`               ffmpeg  = ${ffmpegCheck.ffmpegPath}`);
+    if (ffmpegCheck.ffprobePath) lines.push(`               ffprobe = ${ffmpegCheck.ffprobePath}`);
+  } else {
+    const hint =
+      `❌ PATH 中找不到可用的 ffmpeg/ffprobe。解决：\n` +
+      `   ① 在 PowerShell 里执行下面两行，查到你系统里 ffmpeg.exe / ffprobe.exe 实际在哪：\n` +
+      `        Get-Command ffmpeg  | Select-Object -ExpandProperty Source\n` +
+      `        Get-Command ffprobe | Select-Object -ExpandProperty Source\n` +
+      `   ② 打开 apps/web/.env.local，在末尾加入：\n` +
+      `        FFMPEG_BIN_PATH=第①步查到的 ffmpeg 完整路径\n` +
+      `        FFPROBE_BIN_PATH=第①步查到的 ffprobe 完整路径\n` +
+      `   ③ 保存后 Ctrl+C 停掉 dev server，再重新启动 dev server（D:\\pnpm.CMD --filter @app/web dev）\n` +
+      `   如果第①步 Get-Command 都找不到，请先执行：winget install Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements`;
+    lines.push(`[ffmpeg]       ${hint}`);
+  }
   // 2. whisper-cpp（ASR 上传第一步需要）
   try {
     const asr = createAsrProvider();
@@ -57,13 +73,9 @@ async function ensureBootstrap() {
   lines.push('=======================================');
   // eslint-disable-next-line no-console
   console.log('\n' + lines.join('\n') + '\n');
-  if (!ffmpegOk) {
+  if (!ffmpegCheck.ok) {
     throw new Error(
-      '[启动自检] 系统 PATH 中找不到 ffmpeg/ffprobe。\n' +
-        '解决方法：\n' +
-        '  1. CMD/PowerShell 执行：winget install Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements\n' +
-        '  2. 安装完成后，**必须关闭当前终端再新开一个**（让新的 PATH 生效）\n' +
-        '  3. 在新终端里重新跑：pnpm --filter @app/web dev',
+      '[启动自检] ffmpeg/ffprobe 不可用，详细修复步骤见上方 [ffmpeg] 日志。',
     );
   }
 }
