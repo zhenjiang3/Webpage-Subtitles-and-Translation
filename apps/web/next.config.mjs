@@ -1,7 +1,13 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  serverExternalPackages: ['@prisma/client'],
+  serverExternalPackages: [
+    '@prisma/client',
+    // 方案 A 免费零 API：@xenova/transformers 需要跑 ONNX Runtime（原生 .node 模块 + 读写模型缓存）
+    // 必须 external，否则 Next server bundle 会把它们打包进 RSC payload → 找不到原生 .node 文件
+    '@xenova/transformers',
+    'onnxruntime-node',
+  ],
   images: {
     remotePatterns: [],
   },
