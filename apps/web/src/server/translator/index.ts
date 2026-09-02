@@ -5,8 +5,11 @@ import { XenovaNllbTranslatorProvider, XENOVA_BATCH_SIZE } from './xenova-nllb.p
 export type { TranslateBatchInput } from './types';
 export { translateInBatches, XENOVA_BATCH_SIZE };
 
+/** 当前启用的 translator provider 名称（供自检日志使用，不触发依赖加载） */
+export const TRANSLATOR_PROVIDER_NAME: string = process.env.TRANSLATOR_PROVIDER ?? 'deepl';
+
 export function createTranslatorProvider(): TranslatorProvider {
-  const provider = process.env.TRANSLATOR_PROVIDER ?? 'deepl';
+  const provider = TRANSLATOR_PROVIDER_NAME;
   switch (provider) {
     case 'deepl':
       return new DeeplTranslatorProvider(process.env.DEEPL_API_KEY ?? '');

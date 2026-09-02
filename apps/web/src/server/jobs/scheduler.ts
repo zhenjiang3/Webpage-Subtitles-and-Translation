@@ -25,23 +25,26 @@ async function ensureBootstrap() {
   lines.push('==== ASR/翻译 环境自检 ====');
   // 1. ffmpeg / ffprobe
   const ffmpegOk = await isFFmpegAvailable();
-  lines.push(`[ffmpeg]       ${ffmpegOk ? '✅ PATH 可用' : '❌ PATH 中找不到 ffmpeg，请 winget install Gyan.FFmpeg 后重开 CMD'}`);
-  // 2. whisper-cpp 路径（createAsrProvider 内部会做 fs.existsSync 检查）
+  lines.push(`[ffmpeg]       ${ffmpegOk ? '✅ PATH 可用' : '❌ PATH 中找不到 ffmpeg，请 winget install Gyan.FFmpeg 后重开终端'}`);
+  // 2. whisper-cpp（ASR 上传第一步需要）
   try {
     const asr = createAsrProvider();
     lines.push(`[whisper-cpp]  ✅ provider=${asr.name}`);
-    if ((asr as unknown as { cliPath?: string }).cliPath) {
-      lines.push(`               cli   = ${(asr as unknown as { cliPath: string }).cliPath}`);
-    }
-    if ((asr as unknown as { modelPath?: string }).modelPath) {
-      lines.push(`               model = ${(asr as unknown as { modelPath: string }).modelPath}`);
-    }
-    // 3. translator provider
-    const tr = createTranslatorProvider();
-    lines.push(`[translator]   ✅ provider=${tr.name}`);
+    const anyAsr = asr as unknown as { cliPath?: string; modelPath?: string };
+    if (anyAsr.cliPath) lines.push(`               cli   = ${anyAsr.cliPath}`);
+    if (anyAsr.modelPath) lines.push(`               model = ${anyAsr.modelPath}`);
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    lines.push(`[whisper/translator] ❌ 初始化失败：${msg}`);
+    lines.push(`[whisper-cpp]  ❌ 初始化失败：${msg}`);
+  }
+  // 3. translator（懒加载：不实际创建实例，避免 ASR 阶段被翻译器的依赖问题连带阻塞）
+  //    - 真正点「翻译」按钮时会走 createTranslatorProvider()，那时再加载 @xenova/transformers
+  //    - 这里仅记录已启用的 provider 名称即可
+  try {
+    const name = (await import('@/server/translator')).TRANSLATOR_PROVIDER_NAME;
+    lines.push(`[translator]   ℹ️ provider=${name}（懒加载：首次翻译时才初始化）`);
+  } catch {
+    lines.push(`[translator]   ℹ️ provider=未知（懒加载）`);
   }
   // 4. 上传/会话路径根
   try {
@@ -58,9 +61,9 @@ async function ensureBootstrap() {
     throw new Error(
       '[启动自检] 系统 PATH 中找不到 ffmpeg/ffprobe。\n' +
         '解决方法：\n' +
-        '  1. CMD 执行：winget install Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements\n' +
-        '  2. 安装完成后，**必须关闭当前 CMD 再新开一个**（让新的 PATH 生效）\n' +
-        '  3. 在新 CMD 里重新跑：pnpm --filter @app/web dev',
+        '  1. CMD/PowerShell 执行：winget install Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements\n' +
+        '  2. 安装完成后，**必须关闭当前终端再新开一个**（让新的 PATH 生效）\n' +
+        '  3. 在新终端里重新跑：pnpm --filter @app/web dev',
     );
   }
 }

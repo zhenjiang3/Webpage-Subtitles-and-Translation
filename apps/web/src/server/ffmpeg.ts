@@ -109,12 +109,59 @@ function parseFps(fraction?: string): number | undefined {
   return Math.round((n / d) * 100) / 100;
 }
 
-/** 检查系统 ffmpeg / ffprobe 是否可用 */
-export function isFFmpegAvailable(): Promise<boolean> {
-  return new Promise((resolve) => {
-    const p = spawn('ffmpeg', ['-version']);
-    p.on('error', () => resolve(false));
-    p.on('exit', (code) => resolve(code === 0));
-    setTimeout(() => resolve(false), 5000).unref?.();
-  });
+/**
+ * 检查系统 ffmpeg / ffprobe 是否可用
+ *
+ * Windows 上先调用 `where.exe ffmpeg/ffprobe` 做「PATH 里有没有」的查询
+ * （比直接 spawn('ffmpeg') 更稳：后者在某些 PowerShell / profile / PATH 继承场景里会误报 ENOENT，
+ *  而用户手动在终端里敲 ffmpeg -version 却能成功）。
+ * Unix 上退化为 `command -v`。
+ * 找到文件后，再真实跑一次 `-version` 验证退出码，防止是个空路径/假符号链接。
+ */
+export async function isFFmpegAvailable(): Promise<boolean> {
+  const isWin = process.platform === 'win32';
+  async function which(name: string): Promise<string | null> {
+    return new Promise<string | null>((resolve) => {
+      const [bin, args] = isWin
+        ? (['where.exe', [name]] as const)
+        : (['/bin/sh', ['-c', `command -v -- "${name}"`]] as const);
+      try {
+        const p = spawn(bin, args, {
+          // where.exe 默认会把 PATHEXT 下所有匹配都列出来，可能有多个
+          windowsHide: true,
+        });
+        const out: Buffer[] = [];
+        p.stdout?.on('data', (d) => out.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+        p.on('error', () => resolve(null));
+        p.on('exit', (code) => {
+          if (code !== 0) return resolve(null);
+          const firstLine = Buffer.concat(out)
+            .toString('utf8')
+            .split(/\r?\n/)
+            .map((s) => s.trim())
+            .find(Boolean);
+          resolve(firstLine ?? null);
+        });
+        setTimeout(() => resolve(null), 4000).unref?.();
+      } catch {
+        resolve(null);
+      }
+    });
+  }
+  async function runsOk(cmd: string, args: string[]): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      try {
+        const p = spawn(cmd, args, { windowsHide: true });
+        p.on('error', () => resolve(false));
+        p.on('exit', (code) => resolve(code === 0));
+        setTimeout(() => resolve(false), 5000).unref?.();
+      } catch {
+        resolve(false);
+      }
+    });
+  }
+  const [ff, fp] = await Promise.all([which('ffmpeg'), which('ffprobe')]);
+  if (!ff || !fp) return false;
+  // where.exe 返回的路径通常带 .exe，直接 spawn 绝对路径绕过所有 PATH 继承问题
+  return (await runsOk(ff, ['-version'])) && (await runsOk(fp, ['-version']));
 }
