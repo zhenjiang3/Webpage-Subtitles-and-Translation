@@ -1,0 +1,10 @@
+# apps/web 专用
+node_modules
+.next
+out
+.env
+.env.local
+.env.*.local
+next-env.d.ts
+types
+data

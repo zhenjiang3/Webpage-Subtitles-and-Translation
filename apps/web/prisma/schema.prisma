@@ -1,0 +1,64 @@
+// Prisma schema — V1 极简三表
+// 注意：SQLite 不支持 enum / Json / @db.Text 原生类型，
+//       所以枚举和 cues 用 String 存储，TS 层用 Zod 验证。
+// Docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Session.status 可用值：UPLOADING / PREPROCESSING / ASR_IN_PROGRESS / READY / TRANSLATING / DONE / ERROR
+// Job.type 可用值：ASR / TRANSLATE
+// Job.status 可用值：PENDING / RUNNING / SUCCESS / FAILED
+
+model Session {
+  id             String     @id @default(cuid())
+  videoName      String
+  videoPath      String
+  audioPath      String?
+  videoSizeBytes BigInt
+  durationSec    Int?
+  sourceLang     String?
+  status         String     @default("UPLOADING")
+  errorMessage   String?
+  createdAt      DateTime   @default(now())
+
+  subtitles      Subtitle[]
+  jobs           Job[]
+}
+
+model Subtitle {
+  id        String   @id @default(cuid())
+  sessionId String
+  session   Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  language  String   // "zh" | "en" | "ja"
+  isSource  Boolean
+  cues      String   // JSON string: [{index, startMs, endMs, text}]
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+
+  @@unique([sessionId, language])
+  @@index([sessionId])
+}
+
+model Job {
+  id          String   @id @default(cuid())
+  sessionId   String
+  session     Session  @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  type        String   // ASR / TRANSLATE
+  targetLang  String?
+  status      String   @default("PENDING") // PENDING / RUNNING / SUCCESS / FAILED
+  progress    Int      @default(0)
+  stage       String?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  errorLog    String?  // 长错误堆栈
+  createdAt   DateTime @default(now())
+
+  @@index([status, createdAt])
+}
