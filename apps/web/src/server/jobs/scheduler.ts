@@ -224,7 +224,7 @@ async function runTranslateJob(
     provider,
     { sourceLang, targetLang, texts },
     50,
-    (done, total) => {
+    (done: number, total: number) => {
       const pct = (done / total) * 100;
       void updateProgress(jobId, pct, `翻译中：${done}/${total}`);
     },

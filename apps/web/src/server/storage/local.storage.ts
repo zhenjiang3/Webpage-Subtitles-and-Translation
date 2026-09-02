@@ -63,6 +63,6 @@ export function getFileSize(p: string): number {
   return fs.statSync(p).size;
 }
 
-export function createReadStream(p: string): fs.ReadStream {
-  return fs.createReadStream(p);
+export function createReadStream(p: string, opts?: { start?: number; end?: number }): fs.ReadStream {
+  return fs.createReadStream(p, opts);
 }

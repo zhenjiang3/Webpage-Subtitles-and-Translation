@@ -10,15 +10,6 @@ export const dynamic = 'force-dynamic';
 export const maxDuration = 300; // Vercel 场景最多 5 分钟；V1 本地部署无限
 
 const MAX_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES ?? String(500 * 1024 * 1024), 10);
-
-const ALLOWED_MIMES = new Set([
-  'video/mp4',
-  'video/quicktime',
-  'video/x-matroska',
-  'video/webm',
-  'video/x-msvideo',
-]);
-
 const ALLOWED_EXTS = ['mp4', 'mov', 'webm', 'mkv', 'avi', 'm4v'];
 
 export async function POST(req: Request) {

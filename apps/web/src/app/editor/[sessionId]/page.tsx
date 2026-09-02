@@ -1,7 +1,6 @@
 'use client';
 
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Plyr from 'plyr';
@@ -136,7 +135,6 @@ function BannerInfo({
 
 // ================ 主页面 ================
 export default function EditorPage(props: Params) {
-  const router = useRouter();
   // 由于 params 是 Promise，用一层 hook 封装在客户端层取
   const [sessionId, setSessionId] = useState<string>('');
   const queryClient = useQueryClient();
@@ -153,7 +151,6 @@ export default function EditorPage(props: Params) {
   // ----------- 轮询：拉取 session 信息 + 字幕 -----------
   const {
     data: subtitleData,
-    refetch: refetchSubtitle,
     isLoading: loadingSession,
   } = useQuery({
     queryKey: ['subtitles', sessionId],
@@ -225,6 +222,7 @@ export default function EditorPage(props: Params) {
     if (!activeSubtitle) return;
     setLocalCues(activeSubtitle.cues);
     setDirty(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSubtitle?.id, activeSubtitle?.version]);
 
   // ----------- 保存字幕 PUT /api/subtitles/:sessionId -----------
@@ -286,7 +284,8 @@ export default function EditorPage(props: Params) {
     const seconds = cue.startMs / 1000;
     if (plyrRef.current) {
       plyrRef.current.currentTime = seconds;
-      plyrRef.current.play().catch(() => {});
+      // play() 在 Plyr 文档中通常返回 Promise<void>，老版本返回 void；用 Promise.resolve 统一处理避免 catch 类型报错
+      Promise.resolve(plyrRef.current.play()).catch(() => {});
     }
   };
 
@@ -446,7 +445,9 @@ export default function EditorPage(props: Params) {
                   sourceLang={session.sourceLang}
                   currentLanguages={availableLangs}
                   disabled={translateMutation.isPending}
-                  onTranslate={(targets) => translateMutation.mutateAsync(targets)}
+                  onTranslate={async (targets) => {
+                    await translateMutation.mutateAsync(targets);
+                  }}
                 />
               ) : null}
 

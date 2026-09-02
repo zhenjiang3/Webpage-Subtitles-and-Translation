@@ -1,5 +1,4 @@
 import { fetch } from 'undici';
-import type { LanguageCode } from '@/lib/types';
 import { getDeeplCode } from '@/lib/languages';
 import type { TranslateBatchInput, TranslatorProvider } from './types';
 

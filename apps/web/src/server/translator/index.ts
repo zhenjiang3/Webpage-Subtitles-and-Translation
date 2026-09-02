@@ -1,5 +1,8 @@
 import type { TranslatorProvider } from './types';
-import { DeeplTranslatorProvider } from './deepl.provider';
+import { DeeplTranslatorProvider, translateInBatches } from './deepl.provider';
+
+export type { TranslateBatchInput } from './types';
+export { translateInBatches };
 
 export function createTranslatorProvider(): TranslatorProvider {
   const provider = process.env.TRANSLATOR_PROVIDER ?? 'deepl';

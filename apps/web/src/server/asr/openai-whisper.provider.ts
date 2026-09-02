@@ -41,7 +41,7 @@ export class OpenAiWhisperProvider implements AsrProvider {
         ...form.getHeaders(),
       },
       body: form as unknown as BodyInit,
-    });
+    } as unknown as Parameters<typeof fetch>[1]);
 
     if (!res.ok) {
       const text = await res.text();

@@ -2,7 +2,7 @@
 // — 通过 API 路由代理读取本地视频文件（避免直接暴露 data/uploads 路径）
 import { NextResponse } from 'next/server';
 import path from 'node:path';
-import { createReadStream, fileExists, getFileSize, getSessionPaths } from '@/server/storage/local.storage';
+import { createReadStream, fileExists, getFileSize } from '@/server/storage/local.storage';
 import { prisma } from '@/server/db/prisma';
 
 export const runtime = 'nodejs';
@@ -61,16 +61,7 @@ export async function GET(
     });
   }
   const chunkSize = end - start + 1;
-  const stream = createReadStream(filePath).pipe(
-    // @ts-ignore — Node stream 在 Next Response 中作为 BodyInit 可用
-    new (require('stream').Transform)({
-      transform(chunk: any, _enc: any, cb: any) {
-        cb(null, chunk);
-      },
-    }),
-  );
-  // 简单方案：直接用 createReadStream 带 start/end 选项
-  const rangedStream = require('fs').createReadStream(filePath, { start, end });
+  const rangedStream = createReadStream(filePath, { start, end });
 
   return new NextResponse(rangedStream as unknown as BodyInit, {
     status: 206,
