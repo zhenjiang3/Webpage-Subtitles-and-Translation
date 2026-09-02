@@ -58,16 +58,38 @@ function formatError(err) {
   const parts = [top];
   let cur = err;
   let depth = 0;
+  let hasCertIssue = false;
   while (cur && cur.cause && depth < 5) {
     cur = cur.cause;
     const seg = [];
-    if (cur.code) seg.push(`code=${cur.code}`);
+    if (cur.code) {
+      seg.push(`code=${cur.code}`);
+      if (
+        cur.code === 'UNABLE_TO_VERIFY_LEAF_SIGNATURE' ||
+        cur.code === 'DEPTH_ZERO_SELF_SIGNED_CERT' ||
+        cur.code === 'SELF_SIGNED_CERT_IN_CHAIN' ||
+        cur.code === 'CERT_AUTHORITY_INVALID'
+      ) {
+        hasCertIssue = true;
+      }
+    }
     if (cur.message) seg.push(cur.message);
     if (cur.syscall) seg.push(`syscall=${cur.syscall}`);
     if (cur.hostname) seg.push(`host=${cur.hostname}`);
     if (cur.address) seg.push(`addr=${cur.address}`);
     if (seg.length) parts.push('  原因: ' + seg.join(' | '));
     depth += 1;
+  }
+  if (hasCertIssue) {
+    parts.push(
+      '\n  📌 这是【系统 TLS 证书不被 Node 默认信任】的典型错误，常见原因：\n' +
+        '     - 电脑开启了 360/QQ电脑管家/卡巴斯基 等杀毒软件的「网页防护/HTTPS 扫描」（会替换证书）\n' +
+        '     - 处于公司/学校网络，出口网关做了 HTTPS MITM 代理\n' +
+        '  ✅ 正确做法：请通过 pnpm script 启动（它已自动加 --use-system-ca 读取 Windows 系统证书库）：\n' +
+        '       cd apps/web\n' +
+        '       pnpm setup:offline\n' +
+        '  ❌ 不要用：node scripts/setup-offline.mjs（裸 node 不带 --use-system-ca，必炸）\n',
+    );
   }
   return parts.join('\n');
 }

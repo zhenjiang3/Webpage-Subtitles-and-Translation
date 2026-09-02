@@ -12,7 +12,7 @@
     "db:migrate": "prisma migrate dev",
     "db:push": "prisma db push",
     "db:studio": "prisma studio",
-    "setup:offline": "node scripts/setup-offline.mjs"
+    "setup:offline": "node --use-system-ca scripts/setup-offline.mjs"
   },
   "dependencies": {
     "@prisma/client": "5.22.0",
