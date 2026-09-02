@@ -159,7 +159,7 @@ async function fetchWithRedirect(url, options = undefined) {
 /**
  * 通用下载：支持断点 / 进度 / 失败自动切镜像
  */
-async function download({ urls, dest, sizeHintMB, label }) {
+async function download({ urls, dest, sizeHintMB, label, minSizeMB }) {
   const dir = path.dirname(dest);
   fs.mkdirSync(dir, { recursive: true });
   if (fs.existsSync(dest) && fs.statSync(dest).size > 0) {
@@ -182,6 +182,16 @@ async function download({ urls, dest, sizeHintMB, label }) {
       const reader = Readable.fromWeb(res.body);
       reader.on('data', (chunk) => onChunk(chunk.length));
       await pipeline(reader, writer);
+      // —— 额外完整性检查：如果声明了 minSizeMB，但实际文件太小（典型是代理返回错误页/截断下载），
+      //    直接判定失败，不重命名，继续切下一个源。
+      const stat = fs.statSync(tmp);
+      if (minSizeMB != null && stat.size < minSizeMB * 1024 * 1024) {
+        const actualMB = (stat.size / 1024 / 1024).toFixed(1);
+        throw new Error(
+          `下载文件过疑似不完整（仅 ${actualMB}MB，期望至少 ${minSizeMB}MB）。` +
+            `常见原因：代理返回了错误页 / 重定向到 HTML 登录页 / 中途断连。自动切换下一条链路……`,
+        );
+      }
       fs.renameSync(tmp, dest);
       process.stdout.write('\n'); // 换行
       const size = fs.statSync(dest).size;
@@ -216,6 +226,67 @@ function extractZipWindows(zip, destDir) {
   if (r.status !== 0) {
     throw new Error(`Expand-Archive 失败（退出码 ${r.status ?? 'null'}）`);
   }
+}
+
+/**
+ * 递归列出 root 下所有文件（含子目录），返回绝对路径数组
+ * 用于：不依赖 zip 内部固定目录结构（Release/、whisper-bin-x64/、bin/ 等都能查），
+ *      直接按文件名找到 whisper-cli.exe / dll / 模型。
+ */
+function listAllFiles(root) {
+  const out = [];
+  if (!fs.existsSync(root)) return out;
+  for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const full = path.join(root, entry.name);
+    if (entry.isDirectory()) {
+      out.push(...listAllFiles(full));
+    } else {
+      out.push(full);
+    }
+  }
+  return out;
+}
+
+/**
+ * 把 root 目录下「任意深度的子目录中的文件」全部上移到 root 第一层，
+ * 并清空多余的空子目录。这让不同发布结构的 zip 最终得到统一目录：
+ *   root/Release/*.exe  →  root/*.exe
+ *   root/whisper-bin-x64/*.dll  →  root/*.dll
+ *   root/Release/bin/*.pdb  →  root/*.pdb
+ */
+function flattenAllNestedFiles(root) {
+  const files = listAllFiles(root);
+  for (const src of files) {
+    const rel = path.relative(root, src);
+    if (!rel || path.dirname(rel) === '.') continue; // 已经在根层
+    const dst = path.join(root, path.basename(src));
+    if (fs.existsSync(dst)) {
+      // 如果目标已存在且体积更大/相等，保留原文件并删新的；否则覆盖
+      const sStat = fs.statSync(src);
+      const dStat = fs.statSync(dst);
+      if (sStat.size > dStat.size) {
+        fs.rmSync(dst, { force: true });
+        fs.renameSync(src, dst);
+      } else {
+        fs.rmSync(src, { force: true });
+      }
+    } else {
+      fs.renameSync(src, dst);
+    }
+  }
+  // 清理空的子目录（从深层开始）
+  function removeEmptyDirs(dir) {
+    if (!fs.existsSync(dir)) return;
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) removeEmptyDirs(full);
+    }
+    const contents = fs.readdirSync(dir);
+    if (contents.length === 0 && dir !== root) {
+      try { fs.rmdirSync(dir); } catch { /* noop */ }
+    }
+  }
+  removeEmptyDirs(root);
 }
 
 async function resolveLatestWhisperZipUrl() {
@@ -279,12 +350,13 @@ async function main() {
   const zipBaseUrls = platformOk ? await resolveLatestWhisperZipUrl() : [WHISPER_ZIP_FALLBACK];
   const zipUrls = withGithubProxies(zipBaseUrls);
 
-  // 2. 下载 zip
+  // 2. 下载 zip（whisper-bin-x64.zip 通常 20~35MB，小于 15MB 视为下载了残缺/错误内容）
   if (platformOk) {
     await download({
       urls: zipUrls,
       dest: ZIP_PATH,
       sizeHintMB: 30,
+      minSizeMB: 15,
       label: 'whisper-bin-x64.zip',
     });
 
@@ -292,22 +364,42 @@ async function main() {
     console.log(`  ▶ 解压 ${path.basename(ZIP_PATH)}  →  ${WHISPER_DIR}`);
     try {
       extractZipWindows(ZIP_PATH, WHISPER_DIR);
-      // 解压后可能多一层 whisper-bin-x64/ 目录，需要摊平
-      const innerDir = path.join(WHISPER_DIR, 'whisper-bin-x64');
-      if (fs.existsSync(innerDir)) {
-        for (const f of fs.readdirSync(innerDir)) {
-          const src = path.join(innerDir, f);
-          const dst = path.join(WHISPER_DIR, f);
-          if (fs.existsSync(dst)) fs.rmSync(dst, { recursive: true, force: true });
-          fs.renameSync(src, dst);
+      // 不管 zip 内部是 Release/、whisper-bin-x64/、bin/ 还是更复杂嵌套，
+      // 统一：把所有文件都挪到 WHISPER_DIR 根层，删除多余空子目录
+      flattenAllNestedFiles(WHISPER_DIR);
+
+      const exeName = process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli';
+      // 再做一次递归搜索，确保就算没摊平成功也能定位 exe
+      const candidates = listAllFiles(WHISPER_DIR).filter(
+        (p) => path.basename(p).toLowerCase() === exeName.toLowerCase(),
+      );
+      const exe =
+        candidates.find((p) => path.dirname(p) === WHISPER_DIR) ?? candidates[0] ?? null;
+      if (!exe) {
+        const allFiles = listAllFiles(WHISPER_DIR).map((p) => path.relative(WHISPER_DIR, p));
+        throw new Error(
+          `解压完成但找不到 ${exeName}。解压后所有文件（相对路径）：\n    - ` +
+            (allFiles.length ? allFiles.join('\n    - ') : '(空目录)'),
+        );
+      }
+      // 如果找到的 exe 不在根层（极端情况），再搬一次到根层，保证后续配置路径一致
+      let finalExe = exe;
+      if (path.dirname(exe) !== WHISPER_DIR) {
+        const toRoot = path.join(WHISPER_DIR, exeName);
+        if (fs.existsSync(toRoot)) fs.rmSync(toRoot, { force: true });
+        fs.renameSync(exe, toRoot);
+        finalExe = toRoot;
+        // 同时把同目录下的 dll 也挪到根（否则 exe 启动找不到 DLL）
+        for (const sib of listAllFiles(path.dirname(exe))) {
+          if (sib === toRoot) continue;
+          const ext = path.extname(sib).toLowerCase();
+          if (ext === '.dll' || ext === '.pdb') {
+            const target = path.join(WHISPER_DIR, path.basename(sib));
+            if (!fs.existsSync(target)) fs.renameSync(sib, target);
+          }
         }
-        fs.rmdirSync(innerDir, { recursive: true });
       }
-      const exe = path.join(WHISPER_DIR, process.platform === 'win32' ? 'whisper-cli.exe' : 'whisper-cli');
-      if (!fs.existsSync(exe)) {
-        throw new Error(`解压完成但找不到 ${path.basename(exe)}，目录内容：${fs.readdirSync(WHISPER_DIR).join(' ,')}`);
-      }
-      console.log(`✔ whisper-cli.exe 就绪：${exe}`);
+      console.log(`✔ whisper-cli.exe 就绪：${finalExe}`);
     } finally {
       try {
         fs.rmSync(ZIP_PATH, { force: true });
@@ -318,10 +410,12 @@ async function main() {
   }
 
   // 4. 下载模型 ggml-small.bin（优先级：HF 官方 → hf-mirror 国内镜像 → ModelScope 国内镜像）
+  //    ggml-small.bin 官方 487MB；若下到 < 400MB 基本是残包，直接换下一个源
   await download({
     urls: [HUGGINGFACE_MODEL, HUGGINGFACE_MIRROR, MODELSCOPE_MODEL],
     dest: MODEL_PATH,
     sizeHintMB: 487,
+    minSizeMB: 400,
     label: 'ggml-small.bin（ASR 模型）',
   });
 
