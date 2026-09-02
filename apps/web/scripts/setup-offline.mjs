@@ -37,8 +37,11 @@ const WHISPER_RELEASE_API = 'https://api.github.com/repos/ggml-org/whisper.cpp/r
 const WHISPER_ZIP_FALLBACK = 'https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip';
 
 // GitHub 国内加速代理（注意代理 URL 规则：直接把原始 https://github.com/... 接在代理域名后面即可）
-const GITHUB_PROXY_MOEYY = 'https://github.moeyy.xyz/';
-const GITHUB_PROXY_GHPROXY = 'https://ghproxy.cc/';
+// 挑选历史上在中国大陆可用率较高且证书/DNS 正常的镜像；如果某个镜像在运行时挂掉（超时/证书过期），
+// 它会在本 URL 尝试后失败，并继续下一个，不会卡住整条链路。
+const GITHUB_PROXY_GHFAST = 'https://ghfast.top/';
+const GITHUB_PROXY_99988866 = 'https://gh.api.99988866.xyz/';
+const GITHUB_PROXY_MIRROR = 'https://mirror.ghproxy.com/';
 
 // HuggingFace 模型：官方 + 国内镜像
 const HUGGINGFACE_MODEL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin';
@@ -59,6 +62,8 @@ function formatError(err) {
   let cur = err;
   let depth = 0;
   let hasCertIssue = false;
+  let hasTimeout = false;
+  let hasExpiredCert = false;
   while (cur && cur.cause && depth < 5) {
     cur = cur.cause;
     const seg = [];
@@ -71,6 +76,15 @@ function formatError(err) {
         cur.code === 'CERT_AUTHORITY_INVALID'
       ) {
         hasCertIssue = true;
+      }
+      if (cur.code === 'CERT_HAS_EXPIRED') hasExpiredCert = true;
+      if (
+        cur.code === 'UND_ERR_CONNECT_TIMEOUT' ||
+        cur.code === 'ETIMEDOUT' ||
+        cur.code === 'ECONNRESET' ||
+        cur.code === 'ENOTFOUND'
+      ) {
+        hasTimeout = true;
       }
     }
     if (cur.message) seg.push(cur.message);
@@ -91,13 +105,28 @@ function formatError(err) {
         '  ❌ 不要用：node scripts/setup-offline.mjs（裸 node 不带 --use-system-ca，必炸）\n',
     );
   }
+  if (hasExpiredCert) {
+    parts.push(
+      '\n  📌 该下载镜像站点的 HTTPS 证书已经过期（mirror.ghproxy.com / ghproxy.cc 等免费服务经常发生）。\n' +
+        '     无需手动处理，脚本会自动尝试下一条镜像链路；\n' +
+        '     若所有镜像链路都失败，请直接走文末「手动下载方案」。\n',
+    );
+  }
+  if (hasTimeout) {
+    parts.push(
+      '\n  📌 连接超时/被重置：这个镜像站从当前网络不可达。\n' +
+        '     - 如果你在公司/校园网：通常是 GitHub 海外 IP 被 QoS，脚本会自动切下一个镜像。\n' +
+        '     - 如果开启了 VPN/代理软件：尝试临时切换「直连」/「全局」模式再跑一次。\n' +
+        '     - 所有链路都超时：直接用文末「手动下载方案」。\n',
+    );
+  }
   return parts.join('\n');
 }
 
 /**
  * 把一个 GitHub 原始下载 URL 变成“代理版”（用于国内网络加速）
  * 例：https://github.com/xxx/yyy/releases/download/v1/whisper-bin-x64.zip
- *  →  https://github.moeyy.xyz/https://github.com/xxx/yyy/releases/download/v1/whisper-bin-x64.zip
+ *  →  https://ghfast.top/https://github.com/xxx/yyy/releases/download/v1/whisper-bin-x64.zip
  */
 function throughProxy(proxyBase, rawUrl) {
   if (!proxyBase) return rawUrl;
@@ -106,11 +135,11 @@ function throughProxy(proxyBase, rawUrl) {
 
 /**
  * 给一个候选 URL 列表做代理扩展：
- *   [官方直连, 兜底直连]  →  [官方直连, moeyy代理(官方), ghproxy代理(官方), 兜底直连, moeyy代理(兜底), ghproxy代理(兜底)]
- * 这样 1 个 30MB 的 zip 最多有 6 条下载路径，极大提升国内网络成功率。
+ *   [官方直连, 兜底直连]  →  [官方直连, ghfast代理(官方), 99988866代理(官方), mirror代理(官方), 兜底直连, ...]
+ * 这样 1 个 30MB 的 zip 最多有 8 条下载路径，极大提升国内网络成功率。
  */
 function withGithubProxies(urls) {
-  const proxies = [undefined, GITHUB_PROXY_MOEYY, GITHUB_PROXY_GHPROXY];
+  const proxies = [undefined, GITHUB_PROXY_GHFAST, GITHUB_PROXY_99988866, GITHUB_PROXY_MIRROR];
   const result = [];
   for (const u of urls) {
     for (const p of proxies) {
@@ -119,6 +148,48 @@ function withGithubProxies(urls) {
   }
   // 去重（相同 URL 不重复试）
   return [...new Set(result)];
+}
+
+// —— 下载器 2：PowerShell Invoke-WebRequest（Windows 原生 HTTP）——
+//    Node fetch（undici）在 Windows 下对「HTTPS + MITM + 大文件」组合非常脆：
+//      - 10s 连接超时卡死（UND_ERR_CONNECT_TIMEOUT）
+//      - 大文件只下载 8MB 就莫名完成（undici body stream 被 MITM 截断但不报错）
+//      - 证书链不兼容（即使 --use-system-ca 也偶发 CERT_HAS_EXPIRED）
+//    PowerShell 用系统 WinHTTP/Schannel，读系统证书 + 系统代理，对上面 3 个问题天然免疫。
+//    作为每个 URL 的 fallback。
+function downloadWithPowerShell(url, dest, sizeHintMB, label) {
+  return new Promise((resolve, reject) => {
+    // 注意：ProgressPreference='SilentlyContinue' 能让 487MB 文件快 5-10 倍（否则 IWR 每帧重绘进度巨慢）
+    const psCmd = [
+      `$ErrorActionPreference = 'Stop'`,
+      `$ProgressPreference = 'SilentlyContinue'`,
+      `[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12`,
+      `Invoke-WebRequest -Uri '${url.replace(/'/g, "''")}' -OutFile '${dest.replace(/'/g, "''")}' -UseBasicParsing`,
+    ].join('; ');
+    const startTs = Date.now();
+    // stdio: pipe 不继承，避免 PowerShell 自己写的一堆输出把我们的格式化进度冲掉
+    const child = spawnSync('powershell.exe', ['-NoProfile', '-Command', psCmd], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
+      // 大文件给 15 分钟；比默认长，避免慢网被误杀
+      timeout: 15 * 60 * 1000,
+    });
+    if (child.error) return reject(child.error);
+    if (child.status === 0 && fs.existsSync(dest)) {
+      const sec = ((Date.now() - startTs) / 1000).toFixed(1);
+      const mb = (fs.statSync(dest).size / 1024 / 1024).toFixed(1);
+      process.stdout.write(`\r  [PowerShell] ${label} 完成 ${mb}MB (${sec}s)   \n`);
+      return resolve();
+    }
+    const stderr = (child.stderr ?? '').toString().trim();
+    const stdout = (child.stdout ?? '').toString().trim();
+    const msg = [
+      `PowerShell IWR 失败（exit=${child.status ?? 'null'}）`,
+      stderr ? `  STDERR: ${stderr.split('\n').slice(0, 8).join('\n          ')}` : '',
+      stdout ? `  STDOUT: ${stdout.split('\n').slice(0, 8).join('\n          ')}` : '',
+    ].filter(Boolean).join('\n');
+    reject(new Error(msg));
+  });
 }
 
 // —— 简易进度条（ETL 风格）——
@@ -157,7 +228,9 @@ async function fetchWithRedirect(url, options = undefined) {
 }
 
 /**
- * 通用下载：支持断点 / 进度 / 失败自动切镜像
+ * 通用下载：对每个 URL 先尝试 Node fetch，失败后在 Windows 下自动 fallback 到 PowerShell Invoke-WebRequest。
+ * 原因：Node 的 undici fetch 在 Windows + HTTPS MITM/大文件场景下有几个已知问题（超时/证书/8MB 截断），
+ *       而 PowerShell 走系统 WinHTTP/Schannel，天然兼容系统证书与系统代理，下载成功率显著更高。
  */
 async function download({ urls, dest, sizeHintMB, label, minSizeMB }) {
   const dir = path.dirname(dest);
@@ -168,13 +241,29 @@ async function download({ urls, dest, sizeHintMB, label, minSizeMB }) {
   }
   const tmp = dest + '.downloading';
   let lastErr = null;
+  const canUsePs = process.platform === 'win32';
+
+  function validateSize(file) {
+    if (minSizeMB == null) return true;
+    if (!fs.existsSync(file)) return false;
+    const size = fs.statSync(file).size;
+    if (size < minSizeMB * 1024 * 1024) {
+      const actualMB = (size / 1024 / 1024).toFixed(1);
+      throw new Error(
+        `下载文件疑似不完整（仅 ${actualMB}MB，期望至少 ${minSizeMB}MB）。` +
+          `常见原因：代理返回了错误页 / 重定向到 HTML 登录页 / 中途断连。自动切换下一条链路……`,
+      );
+    }
+    return true;
+  }
+
   for (const url of urls) {
+    // —— 下载器 A：Node fetch（undici）——
+    let nodeFailed = false;
     try {
       console.log(`  ▶ 下载 ${label}  →  ${url}`);
       const { res } = await fetchWithRedirect(url);
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const totalLen = res.headers.get('content-length');
       const hintMB = sizeHintMB ?? (totalLen ? Math.round(parseInt(totalLen, 10) / 1024 / 1024) : undefined);
       const onChunk = makeProgress(label, hintMB);
@@ -182,28 +271,33 @@ async function download({ urls, dest, sizeHintMB, label, minSizeMB }) {
       const reader = Readable.fromWeb(res.body);
       reader.on('data', (chunk) => onChunk(chunk.length));
       await pipeline(reader, writer);
-      // —— 额外完整性检查：如果声明了 minSizeMB，但实际文件太小（典型是代理返回错误页/截断下载），
-      //    直接判定失败，不重命名，继续切下一个源。
-      const stat = fs.statSync(tmp);
-      if (minSizeMB != null && stat.size < minSizeMB * 1024 * 1024) {
-        const actualMB = (stat.size / 1024 / 1024).toFixed(1);
-        throw new Error(
-          `下载文件过疑似不完整（仅 ${actualMB}MB，期望至少 ${minSizeMB}MB）。` +
-            `常见原因：代理返回了错误页 / 重定向到 HTML 登录页 / 中途断连。自动切换下一条链路……`,
-        );
-      }
+      validateSize(tmp); // 抛 → catch → 切 fallback/下一 URL
       fs.renameSync(tmp, dest);
-      process.stdout.write('\n'); // 换行
+      process.stdout.write('\n');
       const size = fs.statSync(dest).size;
       console.log(`✔ ${label} 完成 (${(size / 1024 / 1024).toFixed(1)}MB)  →  ${dest}`);
       return;
     } catch (e) {
+      nodeFailed = true;
       lastErr = e;
-      console.warn(`\n⚠ ${label} 从 ${url} 下载失败：\n${formatError(e)}`);
+      console.warn(`\n⚠ ${label} 从 ${url} 下载失败（Node fetch）：\n${formatError(e)}`);
+      try { fs.rmSync(tmp, { force: true }); } catch { /* noop */ }
+    }
+
+    // —— 下载器 B（仅 Windows）：同一 URL 立刻换 PowerShell 再试一次 ——
+    if (nodeFailed && canUsePs) {
       try {
-        fs.rmSync(tmp, { force: true });
-      } catch {
-        /* noop */
+        console.log(`  ▶ 换 PowerShell 重下 ${label}  →  ${url}`);
+        await downloadWithPowerShell(url, tmp, sizeHintMB, label);
+        validateSize(tmp);
+        fs.renameSync(tmp, dest);
+        const size = fs.statSync(dest).size;
+        console.log(`✔ ${label} 完成 (${(size / 1024 / 1024).toFixed(1)}MB)  →  ${dest}`);
+        return;
+      } catch (ePs) {
+        lastErr = ePs;
+        console.warn(`\n⚠ ${label} 从 ${url} 下载失败（PowerShell 重试）：\n${formatError(ePs)}`);
+        try { fs.rmSync(tmp, { force: true }); } catch { /* noop */ }
       }
     }
   }
