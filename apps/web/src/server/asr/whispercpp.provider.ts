@@ -99,6 +99,16 @@ function formatArgsForShell(args: readonly string[]): string {
 }
 
 /**
+ * 长字符串诊断展示：取开头 + 结尾各 N 字，中间用 "…(跳过 X chars)" 连接
+ * 避免错误堆栈被 help 页撑爆但关键的 invalid option 在开头看不到
+ */
+function headPlusTail(s: string, n = 2000): string {
+  if (!s) return '(空)';
+  if (s.length <= n * 2) return s;
+  return `${s.slice(0, n)}\n…(跳过 ${s.length - n * 2} 个字符)…\n${s.slice(-n)}`;
+}
+
+/**
  * 从 whisper.cpp stderr/stdout 中提取 "[DetectedLanguage]: xx"
  * 不同版本 whisper.cpp 输出格式有差异，这里兼容几种常见模式
  */
@@ -181,7 +191,13 @@ export class WhisperCppProvider implements AsrProvider {
       /* noop */
     }
 
-    // 组合参数：优先写死最稳定的「-osrt + -of prefix」组合，新版老版都能接受
+    // —— 参数选择策略（为了兼容 b4938 新版 CLI 严格/可变的语法）：
+    //    只传「不同版本都公认存在」的核心参数：
+    //      -m model / -f input / -l language / -t threads / -osrt
+    //    移除以下可能触发新版解析歧义并直接走 --help exit 0 的开关：
+    //      -ng（--no-gpu，部分新版不接受短形式或语法不同）
+    //      -v （可能被识别为 --version，或新版需跟随参数）
+    //      -of prefix（部分新版行为不定 → 先不写，默认输出到 <input>.srt，更稳定）
     const args: string[] = [
       '-m',
       this.modelPath,
@@ -192,10 +208,6 @@ export class WhisperCppProvider implements AsrProvider {
       '-t',
       String(this.threads),
       '-osrt',
-      '-of',
-      srtOutPrefix,
-      '-ng',
-      '-v',
     ];
 
     // eslint-disable-next-line no-console
@@ -241,27 +253,30 @@ export class WhisperCppProvider implements AsrProvider {
           opts.onProgress?.(93, `whisper.cpp 完成（耗时 ${elapsed}s），查找 SRT...`);
           resolve();
         } else {
-          const stderrText = Buffer.concat(stderrBuf).toString('utf8').slice(-1500);
-          const stdoutText = Buffer.concat(stdoutBuf).toString('utf8').slice(-1500);
+          const stderrText = Buffer.concat(stderrBuf).toString('utf8');
+          const stdoutText = Buffer.concat(stdoutBuf).toString('utf8');
           reject(
             new Error(
               `[whisper-cpp] 退出码 ${code}（signal ${signal ?? 'none'}）。\n` +
-                `cli: ${this.cliPath}\n` +
+                `cli : ${this.cliPath}\n` +
                 `args: ${JSON.stringify(args)}\n` +
                 `cwd 目录文件：${listDirBrief(audioDir)}\n` +
-                `stderr 末尾：\n${stderrText}\n` +
-                `stdout 末尾：\n${stdoutText}`,
+                `stderr（首+尾）：\n${headPlusTail(stderrText)}\n` +
+                `stdout（首+尾）：\n${headPlusTail(stdoutText)}`,
             ),
           );
         }
       });
     });
 
-    // —— 找 SRT 文件：按优先级找第一个存在且大小 > 0 的
+    // —— 找 SRT 文件：
+    //   第 1 优先级：${audioPath}.srt —— 不传 -of 时 whisper-cli(所有版本) 默认就输出到这个名字
+    //   第 2/3 优先级：历史的 -of <prefix> 命名（老版/新版追加 .wav）
+    //   都命中不到时 → 终极兜底：audioDir 下所有 .srt 按 mtime/size 挑最新最大的
     const srtSearchCandidates = [
+      `${audioPath}.srt`,
       expectedByOfParam,
       expectedByOfParamWavSfx,
-      `${audioPath}.srt`,
     ];
     let resolvedSrt: string | null = null;
     for (const candidate of srtSearchCandidates) {
@@ -300,19 +315,29 @@ export class WhisperCppProvider implements AsrProvider {
     }
 
     if (!resolvedSrt) {
-      const stderrText = Buffer.concat(stderrBuf).toString('utf8').slice(-1500);
-      const stdoutText = Buffer.concat(stdoutBuf).toString('utf8').slice(-1500);
-      throw new Error(
-        `[whisper-cpp] 未找到生成的 SRT 文件。\n` +
-          `按优先级查过：\n  - ${srtSearchCandidates.join('\n  - ')}\n` +
-          `目录实际文件：\n${listDirBrief(audioDir)}\n` +
-          `cli  : ${this.cliPath}\n` +
-          `args : ${JSON.stringify(args)}\n` +
-          `建议：手动在 PowerShell 里跑一遍（复制粘贴即可，退出码应当 0 并生成 SRT）：\n` +
-          `  & "${this.cliPath}" ${formatArgsForShell(args)}\n` +
-          `whisper-cli stderr 末尾：\n${stderrText}\n` +
-          `whisper-cli stdout 末尾：\n${stdoutText}`,
-      );
+      const stderrText = Buffer.concat(stderrBuf).toString('utf8');
+      const stdoutText = Buffer.concat(stdoutBuf).toString('utf8');
+      const maybeHelp =
+        stderrText.length > 2000 ||
+        /usage/i.test(stdoutText) ||
+        /invalid option|unknown option|unrecognized arguments/i.test(stderrText);
+      let msg = '';
+      msg += '[whisper-cpp] 未找到生成的 SRT 文件（whisper exit=0 但目录里没有任何 .srt）\n';
+      msg += '按优先级查过：\n  - ' + srtSearchCandidates.join('\n  - ') + '\n';
+      msg += '实际目录文件：\n' + listDirBrief(audioDir) + '\n';
+      if (maybeHelp) {
+        msg += '⚠ 看起来 whisper-cli 可能把完整 --help 帮助页吐了一遍后 exit 0，而不是真正执行推理。\n';
+        msg += '  常见原因：传了 b4938 新版不兼容的参数开关。本轮已删除可能触发歧义的 -ng / -v / -of 三个开关，仅保留 -m/-f/-l/-t/-osrt。\n';
+        msg += '  如果继续出现帮助页，请贴以下命令在 PowerShell 执行后的前 40 行输出，用于确认真实短选项语法：\n';
+        msg += '    & "' + this.cliPath + '" --help | Select-Object -First 40\n';
+      }
+      msg += 'cli  : ' + this.cliPath + '\n';
+      msg += 'args : ' + JSON.stringify(args) + '\n';
+      msg += 'PowerShell 手动验证命令（1:1 复现）：\n';
+      msg += '  & "' + this.cliPath + '" ' + formatArgsForShell(args) + '\n';
+      msg += 'whisper-cli stderr（首+尾）：\n' + headPlusTail(stderrText) + '\n';
+      msg += 'whisper-cli stdout（首+尾）：\n' + headPlusTail(stdoutText);
+      throw new Error(msg);
     }
 
     // eslint-disable-next-line no-console
