@@ -64,8 +64,7 @@ async function fetchWithRedirect(url, options = undefined) {
     if ([301, 302, 303, 307, 308].includes(res.status)) {
       const loc = res.headers.get('location');
       if (!loc) throw new Error(`Redirect ${res.status} without Location: ${currentUrl}`);
-      currentLoc = new URL(loc, currentUrl).toString();
-      currentUrl = currentLoc;
+      currentUrl = new URL(loc, currentUrl).toString();
       redirects += 1;
       continue;
     }
@@ -73,7 +72,6 @@ async function fetchWithRedirect(url, options = undefined) {
   }
   throw new Error(`Too many redirects (>8) for ${url}`);
 }
-let currentLoc; // helper placeholder
 
 /**
  * 通用下载：支持断点 / 进度 / 失败自动切镜像
@@ -108,7 +106,7 @@ async function download({ urls, dest, sizeHintMB, label }) {
       return;
     } catch (e) {
       lastErr = e;
-      console.warn(`\n⚠ ${label} 从 ${url} 下载失败：${(e as Error).message}`);
+      console.warn(`\n⚠ ${label} 从 ${url} 下载失败：${e && e.message ? e.message : String(e)}`);
       try {
         fs.rmSync(tmp, { force: true });
       } catch {
@@ -116,7 +114,7 @@ async function download({ urls, dest, sizeHintMB, label }) {
       }
     }
   }
-  throw new Error(`所有 ${label} 下载源全部失败。最后一个错误：${(lastErr as Error)?.message ?? lastErr}`);
+  throw new Error(`所有 ${label} 下载源全部失败。最后一个错误：${lastErr && lastErr.message ? lastErr.message : String(lastErr)}`);
 }
 
 /**
@@ -149,7 +147,7 @@ async function resolveLatestWhisperZipUrl() {
       if (hit?.browser_download_url) return [hit.browser_download_url, WHISPER_ZIP_FALLBACK];
     }
   } catch (e) {
-    console.warn(`⚠ 获取 GitHub Releases 元数据失败，直接用固定 URL。原因：${(e as Error).message}`);
+    console.warn(`⚠ 获取 GitHub Releases 元数据失败，直接用固定 URL。原因：${e && e.message ? e.message : String(e)}`);
   }
   return [WHISPER_ZIP_FALLBACK];
 }
