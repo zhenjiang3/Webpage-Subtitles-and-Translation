@@ -6,5 +6,5 @@ out
 .env.local
 .env.*.local
 next-env.d.ts
-types
-data
+/types
+/data

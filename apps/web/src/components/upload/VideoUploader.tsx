@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Upload, FileVideo, CheckCircle2, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -21,7 +21,7 @@ export function VideoUploader({ className }: Props) {
   const [error, setError] = useState<string | null>(null);
   const [fileName, setFileName] = useState<string | null>(null);
 
-  const handleFile = async (file: File) => {
+  const handleFile = useCallback(async (file: File) => {
     setError(null);
     setFileName(file.name);
 
@@ -76,7 +76,7 @@ export function VideoUploader({ className }: Props) {
       setError(err instanceof Error ? err.message : String(err));
       setProgress(null);
     }
-  };
+  }, [router]);
 
   useEffect(() => {
     // 粘贴文件支持
@@ -86,7 +86,7 @@ export function VideoUploader({ className }: Props) {
     };
     window.addEventListener('paste', onPaste);
     return () => window.removeEventListener('paste', onPaste);
-  }, []);
+  }, [handleFile]);
 
   return (
     <div className={cn('w-full max-w-3xl mx-auto', className)}>
