@@ -155,9 +155,11 @@ async function setJobFailed(jobId: string, error: unknown) {
 // ==================== 对外 API：启动任务 ====================
 
 export function startAsrPipeline(sessionId: string, jobId: string): void {
-  ASR_LOCK.withLock(() => runAsrPipeline(sessionId, jobId)).catch((e) =>
-    setJobFailed(jobId, e),
-  );
+  ASR_LOCK.withLock(() => runAsrPipeline(sessionId, jobId)).catch((e) => {
+    // eslint-disable-next-line no-console
+    console.error('[ASR job FAILED] session=', sessionId, 'job=', jobId, '\n', e instanceof Error ? e.stack ?? e.message : String(e));
+    void setJobFailed(jobId, e);
+  });
 }
 
 export function startTranslateJob(
@@ -166,16 +168,22 @@ export function startTranslateJob(
   sourceLang: LanguageCode,
   targetLang: LanguageCode,
 ): void {
-  TRANS_LOCK.withLock(() => runTranslateJob(sessionId, jobId, sourceLang, targetLang)).catch((e) =>
-    setJobFailed(jobId, e),
-  );
+  TRANS_LOCK.withLock(() => runTranslateJob(sessionId, jobId, sourceLang, targetLang)).catch((e) => {
+    // eslint-disable-next-line no-console
+    console.error('[TRANSLATE job FAILED] session=', sessionId, 'job=', jobId, '\n', e instanceof Error ? e.stack ?? e.message : String(e));
+    void setJobFailed(jobId, e);
+  });
 }
 
 // ==================== 核心流程：ASR Pipeline ====================
 
 async function runAsrPipeline(sessionId: string, jobId: string) {
+  // 注意：先把 job 标为 RUNNING，再做 ensureBootstrap。
+  // 如果把 ensureBootstrap 放在 setJobRunning 之前，一旦 ensureBootstrap 抛错，
+  //   job 仍处于 PENDING（前端可能显示为等待中，错误落盘虽能走 setJobFailed 但状态链路混乱）。
+  await setJobRunning(jobId, '环境自检...');
   await ensureBootstrap();
-  await setJobRunning(jobId, '初始化...');
+  await updateProgress(jobId, 3, '初始化...');
 
   const session = await prisma.session.findUnique({ where: { id: sessionId } });
   if (!session) throw new Error(`Session ${sessionId} 不存在`);

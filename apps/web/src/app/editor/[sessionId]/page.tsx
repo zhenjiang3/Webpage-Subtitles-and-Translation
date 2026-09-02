@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Plyr from 'plyr';
-import { ArrowLeft, RefreshCcw, AlertTriangle, Languages } from 'lucide-react';
+import { ArrowLeft, RefreshCcw, AlertTriangle, Languages, Bug, Copy } from 'lucide-react';
 import type { LanguageCode, JobProgress, SubtitleCue, SubtitleData } from '@/lib/types';
 import { formatPlaybackTime } from '@/lib/time';
 import { LANGUAGES, getLanguageLabel } from '@/lib/languages';
@@ -36,7 +36,9 @@ function StatusBanner({
         <AlertTriangle className="w-5 h-5 mt-0.5 flex-shrink-0" />
         <div>
           <p className="font-semibold">处理失败</p>
-          <p className="opacity-90">{errorMsg ?? '未知错误，请重新上传'}</p>
+          <p className="opacity-95 whitespace-pre-wrap break-words leading-relaxed">
+            {errorMsg ?? '未知错误，请重新上传。下方会显示完整报错堆栈，可直接复制给开发者定位。'}
+          </p>
         </div>
       </div>
     );
@@ -164,6 +166,7 @@ export default function EditorPage(props: Params) {
           durationSec: number | null;
           sourceLang: LanguageCode | null;
           status: string;
+          errorMessage?: string | null;
           createdAt: string;
         };
         subtitles: SubtitleData[];
@@ -181,12 +184,29 @@ export default function EditorPage(props: Params) {
     },
   });
 
-  // ----------- 额外轮询：job 进度（ASR + 所有翻译） -----------
-  // 我们不直接获取所有 jobs ID，而是通过字幕接口返回的状态推断；
-  // 为了显示准确进度，提供一个 jobs 查询接口在 V1 实现，这里通过后端返回的 status + 一个总进度
-  // ASR progress：拉 GET /api/jobs/xxx，jobId 通过在字幕 query 中无法获取。
-  // 简化：添加 useQuery 专门拉当前 session 所有 jobs（我们加一个 API，这里先做一个临时 jobs list endpoint）
-  // NOTE：为了避免新增 endpoint，这里改为新增 GET /api/sessions/:id/jobs（写在后面）
+  // ----------- 额外轮询：session 所有 jobs（进度 + 失败堆栈） -----------
+  const { data: jobsData } = useQuery({
+    queryKey: ['session-jobs', sessionId],
+    queryFn: async () => {
+      const res = await fetch(`/api/sessions/${sessionId}/jobs`);
+      if (!res.ok) return { jobs: [] as Array<{ jobId: string; type: string; status: string; progress: number; stage?: string; targetLang?: string; errorLog?: string }> };
+      const json = (await res.json()) as {
+        jobs: Array<{ jobId: string; type: string; status: string; progress: number; stage?: string; targetLang?: string; errorLog?: string }>;
+      };
+      return json;
+    },
+    enabled: !!sessionId,
+    refetchInterval: 2000,
+  });
+  const jobs = jobsData?.jobs ?? [];
+  const asrProgress =
+    (jobs.find((j) => j.type === 'ASR')?.progress) ?? 0;
+  const failedJobs = jobs.filter((j) => j.status === 'FAILED');
+  const firstFailedJob = failedJobs[0];
+  const bannerErrorMsg =
+    subtitleData?.session.errorMessage ||
+    firstFailedJob?.errorLog?.split(/\r?\n/).find((l) => l.trim().length > 0) ||
+    null;
 
   // ----------- 当前语言切换（Tab） -----------
   const availableLangs = useMemo<LanguageCode[]>(
@@ -318,8 +338,7 @@ export default function EditorPage(props: Params) {
   // ----------- 视频 URL -----------
   const videoUrl = sessionId ? `/api/video/${sessionId}` : '';
 
-  // ----------- 占位：jobs progress（V1 用简单值，ASR 进度从字幕数据中无法得到，后续补一个 API） -----------
-  const asrProgress = 0; // TODO: 接入 jobs 详情 API
+  // ----------- 占位：jobs progress（已通过 session-jobs 查询填充 asrProgress / translateJobs，见上方） -----------
 
   if (!sessionId || loadingSession) {
     return (
@@ -387,10 +406,15 @@ export default function EditorPage(props: Params) {
       <main className="container py-6 flex-1 flex flex-col gap-5">
         <StatusBanner
           status={session.status}
-          errorMsg={session.status === 'ERROR' ? '处理出错，请返回首页重试。' : undefined}
+          errorMsg={bannerErrorMsg}
           asrProgress={asrProgress}
-          translateJobs={[]}
+          translateJobs={jobs as JobProgress[]}
         />
+
+        {/* Job 失败堆栈面板（复制粘贴给开发者定位） */}
+        {failedJobs.length > 0 ? (
+          <FailedJobsDebugPanel items={failedJobs as Array<{ type: string; jobId: string; targetLang?: string; stage?: string; errorLog?: string }>} />
+        ) : null}
 
         {/* 语言 Tab 切换 */}
         {showEditor && availableLangs.length > 0 && (
@@ -473,23 +497,106 @@ export default function EditorPage(props: Params) {
             </div>
           </div>
         ) : statusError ? (
-          <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-10 text-center">
-            <p className="text-lg font-semibold text-destructive">视频处理失败</p>
-            <p className="mt-2 text-sm text-muted-foreground">
-              请检查视频是否损坏，或尝试转码后重新上传。
-            </p>
-            <Link
-              href="/"
-              className="mt-6 inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-            >
-              返回首页重新上传
-            </Link>
+          <div className="rounded-xl border border-destructive/40 bg-destructive/5 p-8 text-center space-y-5">
+            <div>
+              <p className="text-lg font-semibold text-destructive">视频处理失败</p>
+              <p className="mt-2 text-sm text-muted-foreground break-words whitespace-pre-wrap">
+                {bannerErrorMsg ?? '请检查视频是否损坏，或尝试转码后重新上传。详细报错信息请见下方「失败诊断信息」面板。'}
+              </p>
+            </div>
+            {failedJobs.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                提示：2 秒后会自动加载最新的失败堆栈；如长时间无堆栈，可将 PowerShell 控制台从 POST /api/upload 开始的新日志截图或复制给开发者。
+              </p>
+            ) : null}
+            <div className="flex flex-wrap items-center justify-center gap-3">
+              <Link
+                href="/"
+                className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+              >
+                返回首页重新上传
+              </Link>
+              {firstFailedJob?.errorLog ? (
+                <button
+                  type="button"
+                  onClick={async () => {
+                    try {
+                      await navigator.clipboard.writeText(firstFailedJob.errorLog ?? '');
+                    } catch {
+                      /* ignore */
+                    }
+                  }}
+                  className="inline-flex items-center gap-2 rounded-lg border px-4 py-2 text-sm font-medium hover:bg-muted transition"
+                >
+                  <Copy className="w-4 h-4" /> 复制完整报错堆栈
+                </button>
+              ) : null}
+            </div>
           </div>
         ) : (
           // 处理中占位动画
           <ProcessingSkeleton status={session.status} />
         )}
       </main>
+    </div>
+  );
+}
+
+function FailedJobsDebugPanel({
+  items,
+}: {
+  items: Array<{ type: string; jobId: string; targetLang?: string; stage?: string; errorLog?: string }>;
+}) {
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  return (
+    <div className="rounded-xl border border-amber-500/40 bg-amber-500/5 p-4 space-y-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 text-sm">
+          <Bug className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+          <span className="font-semibold">失败诊断信息（发送给开发者即可快速定位）</span>
+        </div>
+        <span className="text-xs text-muted-foreground">
+          共 {items.length} 个失败任务
+        </span>
+      </div>
+      {items.map((job) => (
+        <div key={job.jobId} className="rounded-lg border bg-card p-3 space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
+            <div>
+              <span className="font-mono bg-muted rounded px-1.5 py-0.5 mr-2">{job.type}</span>
+              {job.targetLang ? (
+                <span>目标: {LANGUAGES.find((l) => l.code === job.targetLang)?.label ?? job.targetLang}</span>
+              ) : null}
+              {job.stage ? <span className="ml-3">阶段: {job.stage}</span> : null}
+              <span className="ml-3">Job ID: {job.jobId}</span>
+            </div>
+            {job.errorLog ? (
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(job.errorLog ?? '');
+                    setCopiedId(job.jobId);
+                    setTimeout(() => setCopiedId((c) => (c === job.jobId ? null : c)), 1800);
+                  } catch {
+                    /* ignore */
+                  }
+                }}
+                className="inline-flex items-center gap-1 rounded border px-2 py-1 hover:bg-muted transition"
+              >
+                <Copy className="w-3.5 h-3.5" /> {copiedId === job.jobId ? '已复制' : '复制堆栈'}
+              </button>
+            ) : null}
+          </div>
+          {job.errorLog ? (
+            <pre className="rounded-md bg-black/5 dark:bg-white/5 border text-[11px] leading-relaxed p-3 overflow-auto max-h-[420px] font-mono whitespace-pre-wrap break-all text-muted-foreground">
+{job.errorLog}
+            </pre>
+          ) : (
+            <p className="text-xs text-muted-foreground">（无堆栈信息，可能是前端处理阶段报错）</p>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

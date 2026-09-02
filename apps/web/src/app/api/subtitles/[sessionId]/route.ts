@@ -35,6 +35,7 @@ export async function GET(
       durationSec: session.durationSec,
       sourceLang: session.sourceLang,
       status: session.status,
+      errorMessage: session.errorMessage ?? undefined,
       createdAt: session.createdAt.toISOString(),
     },
     subtitles: subtitles.map((s) => ({
