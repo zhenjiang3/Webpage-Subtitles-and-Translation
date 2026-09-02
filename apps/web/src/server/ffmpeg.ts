@@ -32,11 +32,21 @@ export function extractAudioTrack(inputVideo: string, outputWav: string): Promis
       '1',
       outputWav,
     ];
-    const child = spawn('ffmpeg', args, { stdio: 'ignore' });
+    const errBuf: Buffer[] = [];
+    const child = spawn('ffmpeg', args);
+    child.stderr?.on('data', (d) => errBuf.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
     child.on('error', (err) => reject(new Error(`ffmpeg 启动失败: ${err.message}`)));
     child.on('exit', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffmpeg extract audio 退出码: ${code}`));
+      else {
+        const tail = Buffer.concat(errBuf).toString('utf8').trim().slice(-1200);
+        reject(
+          new Error(
+            `ffmpeg extract audio 退出码: ${code}. 输入: ${inputVideo} 输出: ${outputWav}\n` +
+              `ffmpeg 最后日志:\n${tail}`,
+          ),
+        );
+      }
     });
   });
 }
@@ -59,12 +69,20 @@ export async function probeVideo(videoPath: string): Promise<FFProbeInfo> {
 
   await new Promise<void>((resolve, reject) => {
     const child = spawn('ffprobe', args);
-    child.stdout.on('data', (d) => out.push(d));
-    child.stderr.on('data', (d) => err.push(d));
-    child.on('error', (e) => reject(new Error(`ffprobe 启动失败: ${e.message}`)));
+    child.stdout.on('data', (d) => out.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.stderr.on('data', (d) => err.push(Buffer.isBuffer(d) ? d : Buffer.from(d)));
+    child.on('error', (e) => reject(new Error(`ffprobe 启动失败: ${e.message}. 请确认 ffmpeg 已加入系统 PATH 并重启终端。`)));
     child.on('exit', (code) => {
       if (code === 0) resolve();
-      else reject(new Error(`ffprobe 退出码 ${code}: ${Buffer.concat(err).toString('utf8')}`));
+      else {
+        const tail = Buffer.concat(err).toString('utf8').trim().slice(-1200);
+        reject(
+          new Error(
+            `ffprobe 退出码 ${code}. 文件: ${videoPath}\n` +
+              (tail ? `ffprobe 日志:\n${tail}` : ''),
+          ),
+        );
+      }
     });
   });
 

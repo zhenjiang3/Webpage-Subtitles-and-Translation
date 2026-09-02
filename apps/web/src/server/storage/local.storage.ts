@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /**
  * 本地文件存储 — V1 专用
@@ -12,9 +13,18 @@ export interface UploadPaths {
   audioPath: string;
 }
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * monorepo 项目根目录（process.cwd 不可靠：它取决于 dev 命令从哪执行，
+ *   - 从项目根跑 pnpm --filter @app/web dev → cwd = 项目根 → 向上 ../.. 会出盘符
+ *   - 从 apps/web 跑 pnpm dev → cwd = apps/web
+ * 所以改为：基于当前文件 apps/web/src/server/storage/local.storage.ts 往上反推
+ *   __dirname = apps/web/src/server/storage
+ *   向上 4 层 = monorepo 根）
+ */
 function rootDir() {
-  // 从 apps/web 向上 2 层到项目根
-  return path.resolve(process.cwd(), '..', '..');
+  return path.resolve(__dirname, '..', '..', '..', '..', '..');
 }
 
 function uploadRoot() {

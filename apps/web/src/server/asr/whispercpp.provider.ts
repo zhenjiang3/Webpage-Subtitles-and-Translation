@@ -17,14 +17,19 @@ import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import { fileURLToPath } from 'node:url';
 import type { LanguageCode } from '@/lib/types';
 import type { AsrProvider, AsrResult, AsrSegment } from './types';
 import { parseSrt } from '@/lib/subtitles';
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
 function getDefaultWhisperPaths(): { cli: string; model: string } {
-  // 默认：apps/web/tools/whisper/
-  const projectRoot = process.cwd();
-  const toolsDir = path.resolve(projectRoot, 'tools', 'whisper');
+  // 跟 storage 一样反推：
+  //   __dirname = apps/web/src/server/asr
+  //   向上 4 层 = apps/web → tools/whisper 就在它下面
+  const webRoot = path.resolve(__dirname, '..', '..', '..', '..');
+  const toolsDir = path.join(webRoot, 'tools', 'whisper');
   const isWin = process.platform === 'win32';
   return {
     cli: path.join(toolsDir, isWin ? 'whisper-cli.exe' : 'whisper-cli'),

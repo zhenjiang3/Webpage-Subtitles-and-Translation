@@ -10,11 +10,60 @@
 import { prisma } from '@/server/db/prisma';
 import type { LanguageCode, SubtitleCue } from '@/lib/types';
 import { secToMs } from '@/lib/time';
-import { extractAudioTrack, probeVideo } from '@/server/ffmpeg';
+import { extractAudioTrack, isFFmpegAvailable, probeVideo } from '@/server/ffmpeg';
 import { createAsrProvider } from '@/server/asr';
 import { createTranslatorProvider, translateInBatches } from '@/server/translator';
 import { getSessionPaths } from '@/server/storage/local.storage';
 import { encodeCues } from '@/server/db/cues-codec';
+
+// ==================== 启动前一次性自检（上传第一个视频时触发） ====================
+let bootstrapChecked = false;
+async function ensureBootstrap() {
+  if (bootstrapChecked) return;
+  bootstrapChecked = true;
+  const lines: string[] = [];
+  lines.push('==== ASR/翻译 环境自检 ====');
+  // 1. ffmpeg / ffprobe
+  const ffmpegOk = await isFFmpegAvailable();
+  lines.push(`[ffmpeg]       ${ffmpegOk ? '✅ PATH 可用' : '❌ PATH 中找不到 ffmpeg，请 winget install Gyan.FFmpeg 后重开 CMD'}`);
+  // 2. whisper-cpp 路径（createAsrProvider 内部会做 fs.existsSync 检查）
+  try {
+    const asr = createAsrProvider();
+    lines.push(`[whisper-cpp]  ✅ provider=${asr.name}`);
+    if ((asr as unknown as { cliPath?: string }).cliPath) {
+      lines.push(`               cli   = ${(asr as unknown as { cliPath: string }).cliPath}`);
+    }
+    if ((asr as unknown as { modelPath?: string }).modelPath) {
+      lines.push(`               model = ${(asr as unknown as { modelPath: string }).modelPath}`);
+    }
+    // 3. translator provider
+    const tr = createTranslatorProvider();
+    lines.push(`[translator]   ✅ provider=${tr.name}`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    lines.push(`[whisper/translator] ❌ 初始化失败：${msg}`);
+  }
+  // 4. 上传/会话路径根
+  try {
+    const p = getSessionPaths('__healthcheck__');
+    lines.push(`[storage]      ✅ sessionDir = ${p.sessionDir}`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    lines.push(`[storage]      ❌ 初始化失败：${msg}`);
+  }
+  lines.push('=======================================');
+  // eslint-disable-next-line no-console
+  console.log('\n' + lines.join('\n') + '\n');
+  if (!ffmpegOk) {
+    throw new Error(
+      '[启动自检] 系统 PATH 中找不到 ffmpeg/ffprobe。\n' +
+        '解决方法：\n' +
+        '  1. CMD 执行：winget install Gyan.FFmpeg -e --accept-source-agreements --accept-package-agreements\n' +
+        '  2. 安装完成后，**必须关闭当前 CMD 再新开一个**（让新的 PATH 生效）\n' +
+        '  3. 在新 CMD 里重新跑：pnpm --filter @app/web dev',
+    );
+  }
+}
 
 // ==================== 并发控制（信号量） ====================
 class Semaphore {
@@ -110,6 +159,7 @@ export function startTranslateJob(
 // ==================== 核心流程：ASR Pipeline ====================
 
 async function runAsrPipeline(sessionId: string, jobId: string) {
+  await ensureBootstrap();
   await setJobRunning(jobId, '初始化...');
 
   const session = await prisma.session.findUnique({ where: { id: sessionId } });
