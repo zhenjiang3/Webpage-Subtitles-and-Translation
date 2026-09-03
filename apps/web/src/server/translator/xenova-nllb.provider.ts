@@ -32,133 +32,16 @@ let cachedModPromise: Promise<XenovaTransformersMod> | null = null;
 let cachedPipelinePromise: Promise<XenovaPipelineFn> | null = null;
 
 /**
- * 向上回溯 markers 命中的项目根（不依赖 Webpack __dirname / process.cwd()）。
- * 返回绝对路径。优先命中 markers 数量 ≥2 的目录。
+ * 加载 @xenova/transformers（单例懒加载）。
+ *
+ * 📌 Sharp 原生二进制缺失的问题在「包解析层」已根治：
+ *    根 package.json 配置了 pnpm.overrides → sharp 全树替换为 workspace 包 @app/sharp-shim
+ *    （packages/sharp-shim/index.cjs），无论 ESM `import sharp from 'sharp'`
+ *    还是 CJS `require('sharp')`，都会命中 stub，不会再抛 sharp-win32-x64.node 缺失。
+ *    因此本函数不再需要 Module._resolveFilename hook / 动态写 shim 等运行时兜圈子逻辑。
  */
-function resolveProjectRoot(): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const NodeFs = require('node:fs') as typeof import('node:fs');
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const NodePath = require('node:path') as typeof import('node:path');
-  const cwd = process.cwd();
-  const markers = ['pnpm-workspace.yaml', 'pnpm-lock.yaml', 'package.json', '.git', 'apps', 'data'];
-  let dir = cwd;
-  for (let i = 0; i < 8; i++) {
-    let hit = 0;
-    for (const m of markers) {
-      try { if (NodeFs.existsSync(NodePath.join(dir, m))) hit++; } catch { /* noop */ }
-    }
-    if (hit >= 2) return dir;
-    const parent = NodePath.dirname(dir);
-    if (parent === dir) break;
-    dir = parent;
-  }
-  return cwd;
-}
-
-/**
- * 解析「项目下 apps/web/tools/shim/sharp.cjs」真实存在的绝对路径。
- * 找不到时写临时文件到 .next/shims/sharp.cjs 并返回那条路径（终极兜底）。
- * 不在 Hook 里 new Module / 不动 prototype.load，避免 Next webpack 两套 Module 原型引用不同
- *   导致 instanceof 报错：TypeError: The "mod" argument must be an instance of Module. Received an instance of Module。
- */
-function resolveSharpShim(): string {
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const NodeFs = require('node:fs') as typeof import('node:fs');
-  // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-  const NodePath = require('node:path') as typeof import('node:path');
-  const root = resolveProjectRoot();
-  const candidates: string[] = [];
-
-  candidates.push(NodePath.join(root, 'apps/web/tools/shim/sharp.cjs'));
-  candidates.push(NodePath.join(root, 'tools/shim/sharp.cjs'));
-  candidates.push(NodePath.join(root, 'apps/web/src/server/translator/.__sharp-shim__.cjs'));
-
-  if (typeof __filename === 'string') {
-    let d = NodePath.dirname(__filename);
-    for (let i = 0; i < 6; i++) {
-      const base = NodePath.basename(d);
-      if (base === 'web') {
-        candidates.push(NodePath.join(d, 'tools/shim/sharp.cjs'));
-        candidates.push(NodePath.join(d, 'src/server/translator/.__sharp-shim__.cjs'));
-        break;
-      }
-      const parent = NodePath.dirname(d);
-      if (parent === d) break;
-      d = parent;
-    }
-  }
-
-  for (const c of candidates) {
-    try { if (NodeFs.existsSync(c)) return c; } catch { /* noop */ }
-  }
-
-  // 写临时文件
-  const shimDir = NodePath.join(root, '.next', 'shims');
-  try { NodeFs.mkdirSync(shimDir, { recursive: true }); } catch { /* noop */ }
-  const dst = NodePath.join(shimDir, 'sharp.cjs');
-  const SQ = "'";
-  const L: string[] = [];
-  L.push(SQ + 'use strict' + SQ + ';');
-  L.push('// Sharp shim auto-generated at runtime (V1 text-only path).');
-  L.push('// Xenova 顶层 require(' + SQ + 'sharp' + SQ + ') 时使用，避免因 sharp 原生二进制缺失炸 import。');
-  L.push('function createChainable() {');
-  L.push('  var base = Object.create(null);');
-  L.push('  base.toBuffer = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] toBuffer called, enable real sharp.' + SQ + ')); };');
-  L.push('  base.toFile   = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] toFile called, enable real sharp.' + SQ + ')); };');
-  L.push('  base.metadata = function () { return Promise.reject(new Error(' + SQ + '[sharp-shim] metadata called, enable real sharp.' + SQ + ')); };');
-  L.push('  base.clone = function () { return this; };');
-  L.push('  base.pipe  = function () { return this; };');
-  L.push('  return new Proxy(base, {');
-  L.push('    get: function (t, p, r) {');
-  L.push('      var k = String(p);');
-  L.push('      if (k === ' + SQ + 'then' + SQ + ' || k === ' + SQ + 'catch' + SQ + ' || k === ' + SQ + 'finally' + SQ + ') return undefined;');
-  L.push('      if (Object.prototype.hasOwnProperty.call(t, k)) return Reflect.get(t, k, r);');
-  L.push('      return function () { return createChainable(); };');
-  L.push('    }');
-  L.push('  });');
-  L.push('}');
-  L.push('function sharpConstructor() { return createChainable(); }');
-  L.push('sharpConstructor.Sharp = function () { return sharpConstructor.apply(null, arguments); };');
-  L.push('sharpConstructor.default = sharpConstructor;');
-  L.push('sharpConstructor.concurrency = function (n) { return n === undefined ? 1 : sharpConstructor; };');
-  L.push('sharpConstructor.counters    = function ()  { return { process: 0, queue: 0 }; };');
-  L.push('sharpConstructor.simd        = function ()  { return sharpConstructor; };');
-  L.push('sharpConstructor.cache       = function (v) { return v === undefined ? { memory: 0, files: 0, items: 0 } : sharpConstructor; };');
-  L.push('sharpConstructor.queue       = function ()  { return 0; };');
-  L.push('sharpConstructor.versions    = { libvips: ' + SQ + '0.0.0-shim' + SQ + ', sharp: ' + SQ + '0.32.6-shim' + SQ + ', vips: ' + SQ + '0.0.0-shim' + SQ + ' };');
-  L.push('sharpConstructor.format      = Object.freeze({ jpeg: { id: ' + SQ + 'jpeg' + SQ + ' }, png: { id: ' + SQ + 'png' + SQ + ' }, webp: { id: ' + SQ + 'webp' + SQ + ' }, avif: { id: ' + SQ + 'avif' + SQ + ' }, gif: { id: ' + SQ + 'gif' + SQ + ' }, tiff: { id: ' + SQ + 'tiff' + SQ + ' } });');
-  L.push('module.exports = sharpConstructor;');
-  L.push('module.exports.default = sharpConstructor;');
-  L.push('module.exports.Sharp = sharpConstructor.Sharp;');
-
-  try { NodeFs.writeFileSync(dst, L.join(require('node:os').EOL), 'utf8'); } catch { /* noop */ }
-  try { if (NodeFs.existsSync(dst)) return dst; } catch { /* noop */ }
-
-  throw new Error(
-    '[xenova-nllb] 无法定位 sharp shim 文件，且无法写入 .next/shims/sharp.cjs 临时文件。\n' +
-      '候选路径：\n  - ' + candidates.join('\n  - '),
-  );
-}
-
 function loadTransformers(): Promise<XenovaTransformersMod> {
   if (cachedModPromise) return cachedModPromise;
-
-  // 安装一次性 Hook：仅重写 Module._resolveFilename，遇到 require('sharp') 直接返回磁盘真实存在的
-  // sharp shim .cjs 路径，让 Node/Next 正常 CJS require 它，完全不 new Module，不覆盖 prototype.load。
-  (globalThis as unknown as { __XENOVA_NLLB_SHARP_SHIM_INSTALLED__?: boolean }).__XENOVA_NLLB_SHARP_SHIM_INSTALLED__ ??= (() => {
-    // eslint-disable-next-line @typescript-eslint/no-var-requires, @typescript-eslint/no-require-imports
-    const NodeModule = require('node:module') as typeof import('node:module') & {
-      _resolveFilename: (request: string, parent: unknown, isMain: boolean, options?: unknown) => string;
-    };
-    const origResolve = NodeModule._resolveFilename.bind(NodeModule);
-    const shimPath = resolveSharpShim();
-    NodeModule._resolveFilename = function xenovaSharpShimResolve(request, parent, isMain, options) {
-      if (request === 'sharp') return shimPath;
-      return origResolve(request, parent, isMain, options);
-    };
-    return true;
-  })();
 
   // eslint-disable-next-line no-console
   console.log('[xenova-nllb] 开始加载 @xenova/transformers（第一次需 1-10 秒）...');
