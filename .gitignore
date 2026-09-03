@@ -50,3 +50,7 @@ prisma/migrations/*
 # 方案 A 本地离线工具（体积大，setup:offline 自动下载/生成，不入库）
 apps/web/tools/whisper/
 !apps/web/tools/shim/
+
+# Xenova / HuggingFace 本地模型缓存（体积大 900MB+，首次翻译时自动生成，不入库）
+.cache/
+apps/web/.cache/

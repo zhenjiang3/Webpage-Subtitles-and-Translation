@@ -32,13 +32,53 @@ let cachedModPromise: Promise<XenovaTransformersMod> | null = null;
 let cachedPipelinePromise: Promise<XenovaPipelineFn> | null = null;
 
 /**
+ * 记录最终生效的 remoteHost（catch 分支里做可执行提示时拼接更准确）
+ */
+let resolvedRemoteHost: string = '';
+
+// ============================================================================
+// 🛡️ 单例安装：undici 全局 dispatcher 修复 2 类高频网络失败
+//    （Xenova hub.js 内部 fetch 用 undici，不受 axios / request 代理配置影响）
+//    ① 企业 MITM / 自签证书：HF_MIRROR_INSECURE=1 时跳过 TLS 校验（仅本机开发）
+//    ② 公司 HTTP/HTTPS_PROXY 环境变量：自动走 undici ProxyAgent
+//    注：--use-system-ca Node flag 仍优先推荐（它走 Windows 证书商店，比禁用校验安全）
+// ============================================================================
+(globalThis as unknown as { __XENO_UNDICI_PATCHED__?: boolean }).__XENO_UNDICI_PATCHED__ ??= (() => {
+  try {
+    const undici: typeof import('undici') = require('undici');
+    const insecure = process.env.HF_MIRROR_INSECURE === '1';
+    const connectOpts = insecure ? { rejectUnauthorized: false as const } : undefined;
+    const proxyUri =
+      process.env.HTTPS_PROXY || process.env.https_proxy ||
+      process.env.HTTP_PROXY  || process.env.http_proxy;
+    // runtime dispatcher factory：不用严格 TS（undici v5/v6 Options 差异大），any 足够安全
+    const factoryAny: any = (_origin: any, opts: any) =>
+      new undici.Agent({ ...(opts ?? {}), connect: connectOpts });
+    if (proxyUri) {
+      undici.setGlobalDispatcher(new undici.ProxyAgent({ uri: proxyUri, factory: factoryAny } as any));
+      // eslint-disable-next-line no-console
+      console.log(`[xenova-nllb] undici ProxyAgent → ${proxyUri}${insecure ? ' (insecure)' : ''}`);
+    } else {
+      undici.setGlobalDispatcher(new undici.Agent({ connect: connectOpts }));
+      if (insecure) {
+        // eslint-disable-next-line no-console
+        console.log('[xenova-nllb] HF_MIRROR_INSECURE=1：已禁用 TLS 证书校验（仅限本机开发）');
+      }
+    }
+    return true;
+  } catch (e) {
+    // eslint-disable-next-line no-console
+    console.warn('[xenova-nllb] 无法配置 undici dispatcher（不致命，走默认 fetch）：',
+      (e as Error).message);
+    return false;
+  }
+})();
+
+/**
  * 加载 @xenova/transformers（单例懒加载）。
  *
- * 📌 Sharp 原生二进制缺失的问题在「包解析层」已根治：
- *    根 package.json 配置了 pnpm.overrides → sharp 全树替换为 workspace 包 @app/sharp-shim
- *    （packages/sharp-shim/index.cjs），无论 ESM `import sharp from 'sharp'`
- *    还是 CJS `require('sharp')`，都会命中 stub，不会再抛 sharp-win32-x64.node 缺失。
- *    因此本函数不再需要 Module._resolveFilename hook / 动态写 shim 等运行时兜圈子逻辑。
+ * 📌 Sharp 原生二进制：pnpm overrides 在 workspace 层面把 sharp 替换为 stub。
+ * 📌 HuggingFace 网络/证书：见上方 undici dispatcher + 下方 env.remoteHost 配置。
  */
 function loadTransformers(): Promise<XenovaTransformersMod> {
   if (cachedModPromise) return cachedModPromise;
@@ -48,6 +88,21 @@ function loadTransformers(): Promise<XenovaTransformersMod> {
 
   cachedModPromise = import('@xenova/transformers')
     .then((mod) => {
+      // —— 加载成功后立刻配置下载源 + 缓存目录（pipeline 创建前必须生效） ——
+      //   默认用 hf-mirror.com（国内可访问，速度 >> huggingface.co 主站）
+      //   可用环境变量覆盖（优先级从高到低）：
+      //     XENO_REMOTE_HOST > HF_ENDPOINT > HF_MIRROR > 默认 hf-mirror.com
+      const MIRROR_CN = 'https://hf-mirror.com/';
+      const userRemote =
+        process.env.XENO_REMOTE_HOST || process.env.HF_ENDPOINT || process.env.HF_MIRROR;
+      const chosen = userRemote
+        ? (userRemote.endsWith('/') ? userRemote : `${userRemote}/`)
+        : MIRROR_CN;
+      if (mod.env && typeof mod.env.remoteHost === 'string') mod.env.remoteHost = chosen;
+      if (mod.env && process.env.XENOVA_CACHE_DIR) mod.env.cacheDir = process.env.XENOVA_CACHE_DIR;
+      resolvedRemoteHost = chosen;
+      // eslint-disable-next-line no-console
+      console.log(`[xenova-nllb] 模型下载源：${chosen}  缓存：${mod.env?.cacheDir ?? '(xenova 默认)'}`);
       // eslint-disable-next-line no-console
       console.log('[xenova-nllb] @xenova/transformers 加载成功。');
       return mod;
@@ -77,13 +132,57 @@ async function getPipeline(): Promise<XenovaPipelineFn> {
     const pipe = await mod.pipeline('translation', MODEL_ID, {
       // 建议缓存到项目根目录的 .cache，避免 Node 全局权限问题和多用户污染
       cache_dir: process.env.XENOVA_CACHE_DIR ?? undefined,
-      // 不强制下载；本地已有就用本地
-      local_files_only: false,
+      // XENO_FORCE_LOCAL=1：离线环境 / 已手动下好模型时跳过远程下载（防止"偶发网络波动"反复触发重试）
+      local_files_only: process.env.XENO_FORCE_LOCAL === '1',
       dtype: 'q8', // int8 量化（默认可能是 fp16，q8 更适合 CPU + 内存受限）
     } as object);
     return pipe;
   })().catch((e) => {
     cachedPipelinePromise = null;
+    // —— 把 "fetch failed / 证书错误" 等无信息网络报错转换为带可执行修复步骤的中文提示 ——
+    const rawMsg = (e instanceof Error ? e.message : String(e)) ?? '';
+    const stackStr = e instanceof Error ? e.stack ?? '' : '';
+    const full = (rawMsg + '\n' + stackStr).toLowerCase();
+    const netKeywords = [
+      'fetch failed', 'certificate', 'cert_verify', 'tls', 'ssl',
+      'unable to get local issuer', 'self-signed', 'unable to verify the first',
+      'enotfound', 'econnrefused', 'econnreset', 'etimedout', 'esockettimeout',
+      'network request failed', 'bad gateway', '502', '504', '403 forbidden',
+    ];
+    if (netKeywords.some((k) => full.includes(k))) {
+      const remote = resolvedRemoteHost || '(未设置，请先确保 loadTransformers() 运行过)';
+      const hintLines: string[] = [
+        '═══ [xenova-nllb] 模型下载失败（网络 / 证书类错误）═══',
+        `  当前下载源：${remote}`,
+        '  按以下优先级修复（从 ① 开始试，不行再试 ②/③）：',
+        '',
+        '  ① 【推荐·最安全】用 Windows 系统证书（解决企业 MITM 自签证书）',
+        '     在 PowerShell 里关闭当前 dev server 后，重新启动：',
+        '       cd "C:\\Users\\mengz\\Desktop\\Webpage Subtitles and Translation\\apps\\web"',
+        '       $env:NODE_OPTIONS="--use-system-ca"; & D:\\pnpm.CMD dev',
+        '',
+        '  ② 仍然报证书错？临时禁用 TLS 校验（仅本机开发）',
+        '     在 apps/web/.env.local 末尾加一行并重启 dev server：',
+        '       HF_MIRROR_INSECURE=1',
+        '',
+        '  ③ HuggingFace/hf-mirror 都不通？换可用镜像',
+        '     在 apps/web/.env.local 任选一行（国内镜像），重启 dev server：',
+        '       XENO_REMOTE_HOST=https://hf-mirror.com/',
+        '       XENO_REMOTE_HOST=https://hf-mirror.chuying.org/',
+        '     或用公司/自有的 HuggingFace Endpoint：',
+        '       XENO_REMOTE_HOST=https://your-hf-endpoint.example.com/',
+        '',
+        '  ④ 公司/学校有统一 HTTP/HTTPS 代理？',
+        '     在 apps/web/.env.local 末尾加：',
+        '       HTTPS_PROXY=http://127.0.0.1:7890',
+        '',
+        '  ⑤ 模型已经手动下载过？强制本地模式跳过网络',
+        '     在 apps/web/.env.local 末尾加：',
+        '       XENO_FORCE_LOCAL=1',
+        '═══════════════════════════════════════════════════════════',
+      ];
+      throw new Error(hintLines.join('\n') + '\n—— 原始错误 ——\n' + rawMsg);
+    }
     throw e;
   });
   return cachedPipelinePromise;
