@@ -46,3 +46,7 @@ next-env.d.ts
 prisma/*.db
 prisma/migrations/*
 !prisma/migrations/migration_lock.toml
+
+# 方案 A 本地离线工具（体积大，setup:offline 自动下载/生成，不入库）
+apps/web/tools/whisper/
+!apps/web/tools/shim/
